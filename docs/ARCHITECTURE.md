@@ -1,0 +1,31 @@
+# Architecture
+
+playterm is a Cargo workspace with three crates:
+
+| Crate | Role |
+|-------|------|
+| `playterm-subsonic` | Subsonic API client — authentication, endpoints, models |
+| `playterm-player` | Audio engine — rodio-based playback on a dedicated thread, gapless transitions, sample tap for FFT |
+| `playterm` | Binary — TUI, event loop, state management, Kitty graphics |
+
+## Crate responsibilities
+
+**`playterm-subsonic`** is a pure HTTP client with no TUI or audio dependencies. It handles Subsonic API authentication (MD5 token + salt per request), and exposes endpoints for browsing artists/albums/tracks, streaming URLs, search, cover art, and playlist operations.
+
+**`playterm-player`** runs the audio engine on its own `std::thread` (not tokio). It communicates with the TUI through two channels:
+
+- `PlayerCommand` (TUI → player): PlayUrl, EnqueueNext, Pause, Resume, Stop, SetVolume, Seek, Quit
+- `PlayerEvent` (player → TUI): TrackStarted, Progress, AboutToFinish, TrackAdvanced, TrackEnded, Error
+
+Progress events fire on a ~500ms tick. Gapless playback is handled via `EnqueueNext` — the TUI sends the next track's URL when it receives `AboutToFinish` (~10 seconds before the current track ends), and rodio's `Sink::append()` handles the seamless transition.
+
+A `SampleTap` wrapper copies decoded samples into a shared ring buffer for FFT analysis by the visualizer.
+
+**`playterm`** (binary) owns the `App` struct, which holds all application state. The event loop runs on tokio and uses `select!` to race crossterm key/mouse events, player events, library update channels, and timer ticks.
+
+## Key patterns
+
+- **`Action` enum** — every user intent (navigation, playback, queue manipulation) is expressed as an `Action` variant, mapped from key events in the input layer and dispatched through `App::dispatch()`.
+- **`LoadingState<T>`** — `NotLoaded | Loading | Loaded(T) | Error(String)`. Used throughout for async data fetches (albums, tracks, playlists) to keep the UI responsive during network calls.
+- **Skip cancellation** — `PlayerCommand::PlayUrl` carries a generation counter. Rapid skips drain the command channel and only fetch the last requested track.
+- **Kitty graphics** — album art is rendered outside ratatui's layout system using absolute cursor positioning and Kitty escape sequences. Inside tmux, Unicode placeholder mode (`U=1`) avoids pane clipping artifacts.
