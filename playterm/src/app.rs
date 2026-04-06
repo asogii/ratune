@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::style::Color;
@@ -22,6 +23,60 @@ use crate::theme::Theme;
 use playterm_subsonic::LyricLine;
 
 // ── Sizing helper (used in dispatch for scroll clamping) ──────────────────────
+
+/// Map raw engine/network errors to a short status-bar line (no multiline chains).
+fn humanize_playback_error(message: &str) -> String {
+    let raw = message
+        .strip_prefix("playback error: ")
+        .or_else(|| message.strip_prefix("enqueue error: "))
+        .unwrap_or(message);
+    let lower = raw.to_lowercase();
+    if lower.contains("decoding response body") || lower.contains("error decoding") {
+        return "Playback failed: stream interrupted or invalid (retry)".to_string();
+    }
+    if lower.contains("stream http") || lower.contains("http 4") || lower.contains("http 5") {
+        return "Playback failed: server error or denied".to_string();
+    }
+    if lower.contains("connecting to stream")
+        || lower.contains("connection refused")
+        || lower.contains("error sending request")
+        || lower.contains("timeout")
+        || lower.contains("dns")
+    {
+        return "Playback failed: network error".to_string();
+    }
+    if lower.contains("enqueue error") {
+        return "Next track: download failed".to_string();
+    }
+    if lower.contains("reading stream body") {
+        return "Playback failed: stream interrupted (retry)".to_string();
+    }
+    if lower.contains("reading cached track") {
+        return "Playback failed: offline cache unreadable (try disabling cache)".to_string();
+    }
+    let one_line: String = raw
+        .lines()
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .chars()
+        .take(70)
+        .collect();
+    if one_line.is_empty() {
+        return "Playback failed".to_string();
+    }
+    if one_line.chars().count() == 70 {
+        format!("{one_line}…")
+    } else {
+        one_line
+    }
+}
+
+/// Subsonic stream URL vs on-disk offline cache (see [`App::resolve_playback`]).
+enum ResolvedPlayback {
+    Url(String),
+    Cached(PathBuf),
+}
 
 /// Approximate number of visible album thumbnails given cell pixel dimensions.
 /// Assumes the strip is ~80 columns wide (fallback when terminal size unavailable).
@@ -273,7 +328,7 @@ pub struct App {
     pub keybinds: Keybinds,
     /// Resolved theme colours (parsed from config.toml [theme]).
     pub theme: Theme,
-    /// Monotonically increasing counter sent with every `PlayerCommand::PlayUrl`.
+    /// Monotonically increasing counter sent with every play command (`PlayUrl` / `PlayCached`).
     /// The engine uses it to discard stale downloads from rapid skips.
     play_gen: u64,
 
@@ -329,8 +384,9 @@ pub struct App {
     pub playlist_overlay: PlaylistOverlay,
     /// Floating picker for "add track to playlist" (None when not open).
     pub playlist_picker: Option<PlaylistPicker>,
-    /// Transient status message shown in the status bar; expires after ~3 s.
-    pub status_flash: Option<(String, std::time::Instant)>,
+    /// Transient status message shown in the status bar. Second element is when
+    /// the message should be cleared (`Instant::now() >= deadline`).
+    pub status_flash: Option<(String, Instant)>,
 
     // ── Play history (Phase 6.1) ──────────────────────────────────────────────
     /// Persistent play history (loaded on startup, saved on quit).
@@ -352,6 +408,10 @@ pub struct App {
     accent_target: Color,
     /// When the current colour transition started. `None` = no active transition.
     pub accent_transition_start: Option<Instant>,
+
+    /// Linux: MPRIS D-Bus session registration and shared playback snapshot.
+    #[cfg(target_os = "linux")]
+    pub mpris: Option<crate::mpris::MprisLink>,
 }
 
 impl App {
@@ -418,6 +478,8 @@ impl App {
             accent_lerp_from: static_accent,
             accent_target: static_accent,
             accent_transition_start: None,
+            #[cfg(target_os = "linux")]
+            mpris: None,
         })
     }
 
@@ -638,12 +700,15 @@ impl App {
         });
     }
 
-    /// Return `true` when every line in the current lyrics cache has no timestamp
-    /// (i.e. lyrics are plain-text and must be scrolled manually).
+    /// Return `true` when lyrics are plain-text (no timestamps) and should scroll
+    /// with j/k. Empty lines count as *not* unsynced so j/k still moves the queue
+    /// when the lyrics pane is open but has nothing to scroll.
     pub fn lyrics_are_unsynced(&self) -> bool {
         self.lyrics_cache
             .as_ref()
-            .map(|(_, lines)| lines.iter().all(|l| l.time.is_none()))
+            .map(|(_, lines)| {
+                !lines.is_empty() && lines.iter().all(|l| l.time.is_none())
+            })
             .unwrap_or(false)
     }
 
@@ -822,6 +887,7 @@ impl App {
                 }
                 if start_playing && was_empty && !self.queue.songs.is_empty() {
                     self.queue.cursor = 0;
+                    self.queue.scroll = 0;
                     self.play_current();
                 }
             }
@@ -830,6 +896,8 @@ impl App {
                 let accent = extract_accent(&bytes);
                 self.art_cache = Some((cover_id, bytes));
                 self.apply_dynamic_accent(accent);
+                #[cfg(target_os = "linux")]
+                self.mpris_emit_props();
             }
             LibraryUpdate::Lyrics { song_id, lines } => {
                 self.lyrics_loading = false;
@@ -911,7 +979,7 @@ impl App {
             LibraryUpdate::PlaylistTrackAdded { playlist_name, .. } => {
                 self.status_flash = Some((
                     format!("Added to {}", playlist_name),
-                    std::time::Instant::now(),
+                    Instant::now() + Duration::from_secs(2),
                 ));
             }
             LibraryUpdate::PlaylistTrackRemoved { _playlist_id: _, index } => {
@@ -937,6 +1005,7 @@ impl App {
     // ── Player event ingestion ────────────────────────────────────────────────
 
     pub fn handle_player_event(&mut self, event: PlayerEvent) {
+        let progress_only = matches!(&event, PlayerEvent::Progress { .. });
         match event {
             PlayerEvent::TrackStarted => {
                 self.play_recorded = false;
@@ -1040,12 +1109,20 @@ impl App {
             PlayerEvent::AboutToFinish => {
                 // Pre-load the next track for gapless playback.
                 if let Some(next) = self.queue.peek_next().cloned() {
-                    let url = self.subsonic.stream_url(&next.id, self.config.max_bit_rate);
                     let duration =
                         next.duration.map(|s| std::time::Duration::from_secs(u64::from(s)));
-                    let _ = self
-                        .player_tx
-                        .send(PlayerCommand::EnqueueNext { url, duration });
+                    match self.resolve_playback(&next) {
+                        ResolvedPlayback::Cached(path) => {
+                            let _ = self
+                                .player_tx
+                                .send(PlayerCommand::EnqueueNextCached { path, duration });
+                        }
+                        ResolvedPlayback::Url(url) => {
+                            let _ = self
+                                .player_tx
+                                .send(PlayerCommand::EnqueueNext { url, duration });
+                        }
+                    }
                 }
             }
             PlayerEvent::TrackAdvanced => {
@@ -1092,6 +1169,7 @@ impl App {
                 } else if !self.queue.songs.is_empty() {
                     // End of queue — loop back to the first track.
                     self.queue.cursor = 0;
+                    self.queue.scroll = 0;
                     self.play_current();
                 } else {
                     self.playback.current_song = None;
@@ -1099,10 +1177,178 @@ impl App {
                 }
             }
             PlayerEvent::Error(e) => {
-                eprintln!("player error: {e}");
+                // Never eprintln here — stderr draws over the alternate-screen TUI.
+                self.playback.player_loaded = false;
+                self.status_flash = Some((
+                    humanize_playback_error(&e),
+                    Instant::now() + Duration::from_secs(10),
+                ));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if self.mpris.is_some() {
+                if progress_only {
+                    self.mpris_touch_snapshot_only();
+                    // Spec: `Position` must not emit PropertiesChanged on tick. Many shells
+                    // and widgets never poll `Get(Position)` and only resync on `Seeked` or
+                    // `PlaybackStatus` — emit `Seeked` on each progress update (~500 ms) so
+                    // the displayed time advances while playing.
+                    if let Some(link) = &self.mpris {
+                        link.notify_seeked(self.playback.elapsed);
+                    }
+                } else {
+                    self.mpris_emit_props();
+                }
             }
         }
     }
+
+    #[cfg(target_os = "linux")]
+    fn mpris_touch_snapshot_only(&mut self) {
+        if let Some(link) = &self.mpris {
+            crate::mpris::write_snapshot(self, &link.snapshot);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mpris_emit_props(&mut self) {
+        if let Some(link) = &self.mpris {
+            crate::mpris::write_snapshot(self, &link.snapshot);
+            link.notify_refresh();
+        }
+    }
+
+    /// Push current playback state to MPRIS (call after registering the link).
+    #[cfg(target_os = "linux")]
+    pub fn mpris_sync_now(&mut self) {
+        self.mpris_emit_props();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mpris_emit_seek(&mut self, pos: std::time::Duration) {
+        if let Some(link) = &self.mpris {
+            crate::mpris::write_snapshot(self, &link.snapshot);
+            link.notify_seeked(pos);
+            link.notify_refresh();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn mpris_after_action(&mut self, action: &Action) {
+        use crate::action::Action::*;
+        // Search dispatches per keystroke — skip D-Bus work for those.
+        if matches!(
+            action,
+            SearchStart | SearchInput(_) | SearchBackspace | SearchConfirm | SearchCancel
+        ) {
+            return;
+        }
+        let Some(link) = &self.mpris else {
+            return;
+        };
+        crate::mpris::write_snapshot(self, &link.snapshot);
+        match action {
+            SeekForward | SeekBackward | SeekTo(_) => {
+                link.notify_seeked(self.playback.elapsed);
+                link.notify_refresh();
+            }
+            _ => {
+                link.notify_refresh();
+            }
+        }
+    }
+
+    /// Handle D-Bus MPRIS remote control (Linux).
+    #[cfg(target_os = "linux")]
+    pub fn handle_mpris_control(&mut self, c: crate::mpris::MprisControl) {
+        use crate::mpris::MprisControl::*;
+        match c {
+            PlayPause => {
+                self.dispatch(Action::PlayPause);
+                return;
+            }
+            Next => {
+                self.dispatch(Action::NextTrack);
+                return;
+            }
+            Previous => {
+                self.dispatch(Action::PrevTrack);
+                return;
+            }
+            Pause => {
+                if self.playback.player_loaded && !self.playback.paused {
+                    self.playback.paused = true;
+                    let _ = self.player_tx.send(PlayerCommand::Pause);
+                }
+            }
+            Play => {
+                if !self.playback.player_loaded && self.queue.current().is_some() {
+                    self.play_current();
+                } else if self.playback.paused {
+                    self.playback.paused = false;
+                    let _ = self.player_tx.send(PlayerCommand::Resume);
+                }
+            }
+            Stop => {
+                let _ = self.player_tx.send(PlayerCommand::Stop);
+                self.playback.player_loaded = false;
+                self.playback.elapsed = std::time::Duration::ZERO;
+                self.playback.paused = false;
+            }
+            SeekDelta(dt_micros) => {
+                let cur = self.playback.elapsed.as_micros() as i128;
+                let target = cur + i128::from(dt_micros);
+                let clamped_low = target.max(0);
+                let max_micros = self
+                    .playback
+                    .total
+                    .map(|t| t.as_micros() as i128)
+                    .unwrap_or(clamped_low);
+                let final_micros = clamped_low.min(max_micros).max(0);
+                let new_pos = std::time::Duration::from_micros(final_micros as u64);
+                let _ = self.player_tx.send(PlayerCommand::Seek(new_pos));
+                self.playback.elapsed = new_pos;
+                self.mpris_emit_seek(new_pos);
+                return;
+            }
+            SetPosition {
+                track_path,
+                position_micros,
+            } => {
+                let Some(song) = self.playback.current_song.as_ref() else {
+                    return;
+                };
+                let expected = crate::mpris::dbus_track_path_for_song_id(&song.id);
+                if track_path != expected {
+                    return;
+                }
+                let mut new_pos = std::time::Duration::from_micros(position_micros.max(0) as u64);
+                if let Some(total) = self.playback.total {
+                    new_pos = new_pos.min(total);
+                }
+                let _ = self.player_tx.send(PlayerCommand::Seek(new_pos));
+                self.playback.elapsed = new_pos;
+                self.mpris_emit_seek(new_pos);
+                return;
+            }
+            SetVolume(v) => {
+                let pct = (v.clamp(0.0, 1.0) * 100.0).round() as u8;
+                self.config.default_volume = pct;
+                let _ = self
+                    .player_tx
+                    .send(PlayerCommand::SetVolume(self.config.default_volume as f32 / 100.0));
+            }
+            Quit => {
+                self.dispatch(Action::Quit);
+                return;
+            }
+        }
+        self.mpris_emit_props();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn handle_mpris_control(&mut self, _c: crate::mpris::MprisControl) {}
 
     /// Send a PlayUrl command for the song the queue cursor points at.
     fn play_current(&mut self) {
@@ -1110,30 +1356,31 @@ impl App {
             self.play_gen += 1;
             // Advance the prefetch gen so stale background downloads are discarded.
             self.prefetch_gen.fetch_add(1, Ordering::Release);
-            let url = self.resolve_stream_url(&song);
             let duration = song.duration.map(|s| std::time::Duration::from_secs(u64::from(s)));
+            let resolved = self.resolve_playback(&song);
             self.playback.current_song = Some(song);
             self.playback.player_loaded = true;
-            let _ = self.player_tx.send(PlayerCommand::PlayUrl { url, duration, gen: self.play_gen });
-        }
-    }
-
-    /// Return the URL to play for `song`.
-    ///
-    /// If the track is in the offline cache, starts a loopback HTTP server that
-    /// serves the cached bytes and returns `http://127.0.0.1:{port}/`.
-    /// Falls back to the Subsonic stream URL on any error or cache miss.
-    fn resolve_stream_url(&mut self, song: &playterm_subsonic::Song) -> String {
-        if self.config.cache_enabled {
-            if let Some(path) = self.cache.get(&song.id) {
-                self.cache.touch(&song.id);
-                match crate::cache::serve_from_cache(path) {
-                    Ok(local_url) => return local_url,
-                    Err(e) => eprintln!("warn: could not serve from cache: {e}"),
+            let gen = self.play_gen;
+            match resolved {
+                ResolvedPlayback::Cached(path) => {
+                    let _ = self.player_tx.send(PlayerCommand::PlayCached { path, duration, gen });
+                }
+                ResolvedPlayback::Url(url) => {
+                    let _ = self.player_tx.send(PlayerCommand::PlayUrl { url, duration, gen });
                 }
             }
         }
-        self.subsonic.stream_url(&song.id, self.config.max_bit_rate)
+    }
+
+    /// Resolve a Subsonic stream URL or a finished on-disk cache file for `song`.
+    fn resolve_playback(&mut self, song: &playterm_subsonic::Song) -> ResolvedPlayback {
+        if self.config.cache_enabled {
+            if let Some(path) = self.cache.get(&song.id) {
+                self.cache.touch(&song.id);
+                return ResolvedPlayback::Cached(path);
+            }
+        }
+        ResolvedPlayback::Url(self.subsonic.stream_url(&song.id, self.config.max_bit_rate))
     }
 
     /// Spawn a background task to download `song_id` for caching.
@@ -1166,6 +1413,7 @@ impl App {
     // ── Action dispatch ───────────────────────────────────────────────────────
 
     pub fn dispatch(&mut self, action: Action) {
+        let mpris_action_hook = action.clone();
         match action {
             Action::ToggleHelp => {
                 let was_visible = self.help_visible;
@@ -1538,6 +1786,8 @@ impl App {
             }
             Action::None => {}
         }
+        #[cfg(target_os = "linux")]
+        self.mpris_after_action(&mpris_action_hook);
     }
 
     // ── Pending artist pre-selection ──────────────────────────────────────────
@@ -1776,7 +2026,12 @@ impl App {
                 // Enter on Tracks: add the highlighted track to the queue
                 BrowserColumn::Tracks => self.handle_add_to_queue(),
             },
-            Tab::NowPlaying => {} // nothing to select in queue view
+            Tab::NowPlaying => {
+                // Enter: jump playback to the highlighted queue row.
+                if !self.queue.songs.is_empty() {
+                    self.play_current();
+                }
+            }
         }
     }
 
@@ -1799,13 +2054,12 @@ impl App {
             }
             HomeSection::RecentTracks => {
                 let idx = self.home.selected_index;
-                if let Some(record) = self.home.recent_tracks.get(idx) {
+                if let Some(record) = self.home.recent_tracks.get(idx).cloned() {
                     // We have a PlayRecord but need a Song. Find it in the queue or
                     // create a minimal Song so we can play it.  The simplest
-                    // approach: construct the stream URL directly and push a
-                    // synthetic Song into the queue.
+                    // approach: push a synthetic Song into the queue, then resolve
+                    // the stream URL (cache-aware, properly encoded query params).
                     let song_id = record.song_id.clone();
-                    let url = self.subsonic.stream_url(&song_id, self.config.max_bit_rate);
                     // Build a minimal Song for queue display.
                     let song = playterm_subsonic::Song {
                         id: song_id,
@@ -1842,9 +2096,31 @@ impl App {
                     } else {
                         None
                     };
+                    let sid = record.song_id.clone();
+                    let resolved = match self.queue.current().cloned() {
+                        Some(s) => self.resolve_playback(&s),
+                        None => ResolvedPlayback::Url(
+                            self.subsonic.stream_url(&sid, self.config.max_bit_rate),
+                        ),
+                    };
                     self.playback.player_loaded = true;
                     let gen = self.play_gen;
-                    let _ = self.player_tx.send(playterm_player::PlayerCommand::PlayUrl { url, duration: dur, gen });
+                    match resolved {
+                        ResolvedPlayback::Cached(path) => {
+                            let _ = self.player_tx.send(playterm_player::PlayerCommand::PlayCached {
+                                path,
+                                duration: dur,
+                                gen,
+                            });
+                        }
+                        ResolvedPlayback::Url(url) => {
+                            let _ = self.player_tx.send(playterm_player::PlayerCommand::PlayUrl {
+                                url,
+                                duration: dur,
+                                gen,
+                            });
+                        }
+                    }
                 }
             }
             HomeSection::TopArtists => {
@@ -2106,8 +2382,8 @@ impl App {
 
     /// Clear an expired status flash (call once per frame in the main loop).
     pub fn tick_status_flash(&mut self) {
-        if let Some((_, instant)) = &self.status_flash {
-            if instant.elapsed() >= std::time::Duration::from_secs(2) {
+        if let Some((_, deadline)) = &self.status_flash {
+            if Instant::now() >= *deadline {
                 self.status_flash = None;
             }
         }
@@ -2215,12 +2491,14 @@ impl App {
                     let songs = songs.clone();
                     self.queue.songs.clear();
                     self.queue.cursor = 0;
+                    self.queue.scroll = 0;
                     self.queue.pre_shuffle_order = None;
                     for song in songs {
                         self.queue.push(song);
                     }
                     if !self.queue.songs.is_empty() {
                         self.queue.cursor = 0;
+                        self.queue.scroll = 0;
                         self.play_current();
                     }
                 }
@@ -2234,6 +2512,7 @@ impl App {
                     }
                     if was_empty && !self.queue.songs.is_empty() {
                         self.queue.cursor = 0;
+                        self.queue.scroll = 0;
                         self.play_current();
                     }
                 }
@@ -2246,9 +2525,11 @@ impl App {
                     {
                         self.queue.songs.clear();
                         self.queue.cursor = 0;
+                        self.queue.scroll = 0;
                         self.queue.pre_shuffle_order = None;
                         self.queue.push(song);
                         self.queue.cursor = 0;
+                        self.queue.scroll = 0;
                         self.play_current();
                     }
                 }
@@ -2263,6 +2544,7 @@ impl App {
                         self.queue.push(song);
                         if was_empty {
                             self.queue.cursor = 0;
+                            self.queue.scroll = 0;
                             self.play_current();
                         }
                     }

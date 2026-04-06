@@ -1,6 +1,7 @@
 mod action;
 mod app;
 mod cache;
+mod mpris;
 mod color;
 mod config;
 mod history;
@@ -16,7 +17,7 @@ use std::io;
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -123,7 +124,23 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &mut app, signal_quit).await;
+    #[cfg(target_os = "linux")]
+    let mpris_ctrl_rx = if let Some((link, rx)) = mpris::setup(app.config.mpris_enabled) {
+        app.mpris = Some(link);
+        app.mpris_sync_now();
+        Some(rx)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mpris_ctrl_rx: Option<std::sync::mpsc::Receiver<crate::mpris::MprisControl>> = None;
+
+    let result = run_loop(&mut terminal, &mut app, signal_quit, mpris_ctrl_rx).await;
+
+    #[cfg(target_os = "linux")]
+    if let Some(m) = app.mpris.take() {
+        m.shutdown();
+    }
 
     // Clear any Kitty images before leaving the alternate screen.
     if app.kitty_supported {
@@ -164,6 +181,7 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     signal_quit: Arc<AtomicBool>,
+    mpris_ctrl_rx: Option<std::sync::mpsc::Receiver<crate::mpris::MprisControl>>,
 ) -> Result<()> {
     // `last_rendered_art` — the (cover_id, rect) of the last full image
     // transmission.  Kept across tab switches so we can detect whether a
@@ -175,13 +193,14 @@ async fn run_loop(
     // redisplay it instantly with `a=p,i=1` when switching back.
     let mut last_rendered_art: Option<(String, Rect)> = None;
     let mut art_displayed = false;
+    // Cover id for which `render_image` failed (e.g. undecodable bytes). Without
+    // this latch the loop retries every frame and spams stderr.
+    let mut kitty_cover_unrenderable: Option<String> = None;
     let mut last_tab = app.active_tab;
 
-    // 2-second fallback timer: re-render album art when it is missing.
-    // Fires every 2 s; the render block only acts when art_displayed is false,
-    // so it is a no-op during normal playback (no flicker).
-    let mut art_recovery = tokio::time::interval(Duration::from_secs(2));
-    art_recovery.tick().await; // consume the initial immediate tick
+    // 2-second fallback: nudge Kitty art re-transmit when it is missing.
+    // Checked once per loop iteration (see below).
+    let mut last_art_recovery_fire = Instant::now();
 
     loop {
         // Check for SIGTERM / SIGHUP from the signal handler task.
@@ -198,6 +217,12 @@ async fn run_loop(
             app.handle_player_event(event);
         }
 
+        if let Some(rx) = &mpris_ctrl_rx {
+            while let Ok(c) = rx.try_recv() {
+                app.handle_mpris_control(c);
+            }
+        }
+
         // Advance colour transition before drawing.
         app.tick_accent_transition();
 
@@ -212,6 +237,14 @@ async fn run_loop(
         // ── Kitty album art (rendered after ratatui so it sits above text) ──────
         if app.kitty_supported {
             if app.active_tab == app::Tab::NowPlaying {
+                // New cover id → drop any "unrenderable" latch from a previous track.
+                match (&app.art_cache, &kitty_cover_unrenderable) {
+                    (Some((cid, _)), Some(bad)) if bad != cid => {
+                        kitty_cover_unrenderable = None;
+                    }
+                    _ => {}
+                }
+
                 // On every entry to NowPlaying (including initial load) drop any
                 // cached render state so the art is fully re-transmitted this frame.
                 // The fast display_image() path (a=p,i=1) can silently fail if the
@@ -231,22 +264,41 @@ async fn run_loop(
                 } else if let Some((cover_id, bytes)) = &app.art_cache {
                     let sz = terminal.size()?;
                     let art_rect = ui::layout::art_rect(Rect::new(0, 0, sz.width, sz.height));
-                    let stored_matches = last_rendered_art
-                        .as_ref()
-                        .map(|(id, r)| id == cover_id && r == &art_rect)
-                        .unwrap_or(false);
 
-                    if stored_matches && art_displayed {
-                        // Image is already visible — nothing to do.
+                    if kitty_cover_unrenderable.as_deref() == Some(cover_id.as_str()) {
+                        if art_displayed {
+                            let _ = ui::kitty_art::clear_image(app.in_tmux);
+                            art_displayed = false;
+                        }
                     } else {
-                        // Album changed, first display, tab return, or terminal
-                        // was resized — full re-encode and re-transmit.
-                        match ui::kitty_art::render_image(bytes, art_rect, app.in_tmux, app.tmux_status_offset) {
-                            Ok(()) => {
-                                last_rendered_art = Some((cover_id.clone(), art_rect));
-                                art_displayed = true;
+                        let stored_matches = last_rendered_art
+                            .as_ref()
+                            .map(|(id, r)| id == cover_id && r == &art_rect)
+                            .unwrap_or(false);
+
+                        if stored_matches && art_displayed {
+                            // Image is already visible — nothing to do.
+                        } else {
+                            // Album changed, first display, tab return, or terminal
+                            // was resized — full re-encode and re-transmit.
+                            match ui::kitty_art::render_image(
+                                bytes,
+                                art_rect,
+                                app.in_tmux,
+                                app.tmux_status_offset,
+                            ) {
+                                Ok(()) => {
+                                    last_rendered_art = Some((cover_id.clone(), art_rect));
+                                    art_displayed = true;
+                                }
+                                Err(e) => {
+                                    eprintln!("kitty render: {e}");
+                                    let _ = ui::kitty_art::clear_image(app.in_tmux);
+                                    kitty_cover_unrenderable = Some(cover_id.clone());
+                                    last_rendered_art = None;
+                                    art_displayed = false;
+                                }
                             }
-                            Err(e) => eprintln!("kitty render: {e}"),
                         }
                     }
                 } else if art_displayed {
@@ -305,42 +357,26 @@ async fn run_loop(
         }
         last_tab = app.active_tab;
 
-        // Wait for poll timeout or art-recovery tick — whichever comes first.
-        // During visualizer or colour transitions run at 33 ms (~30 fps);
-        // otherwise 50 ms keeps the progress bar responsive.
-        let poll_ms = if app.visualizer_visible || app.accent_transition_active() { 33 } else { 50 };
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(poll_ms)) => {}
-            _ = art_recovery.tick() => {
-                // Tick fired: if art is missing and should be shown, nudge the
-                // render block by clearing last_rendered_art.  The full re-encode
-                // runs at the top of the next iteration — no duplicate render logic.
-                if app.kitty_supported
-                    && !art_displayed
-                    && app.art_cache.is_some()
-                    && app.active_tab == app::Tab::NowPlaying
-                    && !app.help_visible
-                {
-                    last_rendered_art = None;
-                }
-            }
-        }
-
-        // Non-blocking drain: process any crossterm event that arrived during the sleep.
-        match event::poll(Duration::from_millis(0)) {
-            // stdin closed / pty destroyed (e.g. tmux pane killed) — quit cleanly.
+        // Block until the frame interval elapses *or* input is ready.  Previously we
+        // slept first and only then polled stdin, which added a full period (50 ms)
+        // of latency to every keypress.
+        let poll_ms = if app.visualizer_visible || app.accent_transition_active() {
+            33
+        } else {
+            50
+        };
+        match event::poll(Duration::from_millis(poll_ms)) {
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe
-                   || e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                || e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 app.should_quit = true;
             }
             Err(e) => return Err(e.into()),
             Ok(false) => {}
-            Ok(true) => {
+            Ok(true) => loop {
                 let read_result = event::read();
                 match read_result {
-                    // Same stdin-closed handling for the read side.
                     Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe
-                           || e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        || e.kind() == std::io::ErrorKind::UnexpectedEof => {
                         app.should_quit = true;
                     }
                     Err(e) => return Err(e.into()),
@@ -450,12 +486,49 @@ async fn run_loop(
                 _ => {}
                     } // end Ok(ev) match
                 }     // end read_result match
-            }         // end Ok(true)
-        }             // end poll_result match
+
+                if app.should_quit {
+                    break;
+                }
+
+                match event::poll(Duration::ZERO) {
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe
+                        || e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        app.should_quit = true;
+                        break;
+                    }
+                    Err(e) => return Err(e.into()),
+                    Ok(false) => break,
+                    Ok(true) => {}
+                }
+            },
+        }
+
+        if last_art_recovery_fire.elapsed() >= Duration::from_secs(2) {
+            last_art_recovery_fire = Instant::now();
+            let latched_bad = match (&app.art_cache, &kitty_cover_unrenderable) {
+                (Some((cid, _)), Some(bad)) if bad == cid => true,
+                _ => false,
+            };
+            if app.kitty_supported
+                && !art_displayed
+                && app.art_cache.is_some()
+                && app.active_tab == app::Tab::NowPlaying
+                && !app.help_visible
+                && !latched_bad
+            {
+                last_rendered_art = None;
+            }
+        }
 
         // Drain once more so any triggered playback reflects on next frame.
         while let Ok(event) = app.player_rx.try_recv() {
             app.handle_player_event(event);
+        }
+        if let Some(rx) = &mpris_ctrl_rx {
+            while let Ok(c) = rx.try_recv() {
+                app.handle_mpris_control(c);
+            }
         }
 
         if app.should_quit {
@@ -1055,14 +1128,11 @@ fn handle_mouse_click(x: u16, y: u16, app: &mut App, terminal_size: ratatui::lay
             }
         }
         Tab::NowPlaying => {
-            // NowPlaying center: [50% art | 50% queue]
-            let np_center = Layout::horizontal([
-                Constraint::Percentage(50),
-                Constraint::Percentage(50),
-            ])
-            .split(center);
-
-            let queue_area = np_center[1];
+            let queue_area = ui::layout::now_playing_queue_widget_rect(
+                center,
+                app.lyrics_visible,
+                app.visualizer_visible,
+            );
             if x < queue_area.x || x >= queue_area.x + queue_area.width {
                 return;
             }

@@ -225,6 +225,22 @@ impl SubsonicClient {
     /// transcoding.
     #[must_use]
     pub fn stream_url(&self, id: &str, max_bit_rate: u32) -> String {
+        let Ok(mut url) = url::Url::parse(&format!("{}/rest/stream", self.base_url)) else {
+            return self.stream_url_fallback(id, max_bit_rate);
+        };
+        {
+            let mut q = url.query_pairs_mut();
+            for (k, v) in self.auth_params() {
+                q.append_pair(k, &v);
+            }
+            q.append_pair("id", id);
+            q.append_pair("maxBitRate", &max_bit_rate.to_string());
+        }
+        url.into()
+    }
+
+    /// Pre-encoding fallback if `base_url` is not a valid URL prefix (should be rare).
+    fn stream_url_fallback(&self, id: &str, max_bit_rate: u32) -> String {
         let params = self.auth_params();
         let mut parts: Vec<String> = params
             .iter()
@@ -270,14 +286,14 @@ impl SubsonicClient {
     pub async fn get_cover_art(&self, id: &str) -> Result<Vec<u8>> {
         let mut params = self.auth_params();
         params.push(("id", id.to_string()));
-        let bytes = self
+        let response = self
             .http
             .get(self.endpoint_url("getCoverArt"))
             .query(&params)
             .send()
             .await?
-            .bytes()
-            .await?;
+            .error_for_status()?;
+        let bytes = response.bytes().await?;
         Ok(bytes.to_vec())
     }
 

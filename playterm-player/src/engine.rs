@@ -7,10 +7,15 @@
 //! - `PlayerEvent`  (engine → TUI): progress ticks, track-ended, errors.
 
 use std::collections::VecDeque;
+use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
+use std::sync::OnceLock;
+use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use reqwest::header::ACCEPT_ENCODING;
 use rodio::{Decoder, DeviceSinkBuilder, Player};
 
 use crate::tap::SampleTap;
@@ -27,11 +32,15 @@ pub enum PlayerCommand {
     /// `gen` is a monotonically increasing counter from the TUI; the engine
     /// uses it to discard stale downloads when multiple skips arrive quickly.
     PlayUrl { url: String, duration: Option<Duration>, gen: u64 },
+    /// Same semantics as [`PlayUrl`](Self::PlayUrl), but reads audio from a local cache file.
+    PlayCached { path: PathBuf, duration: Option<Duration>, gen: u64 },
     /// Append the next track to the player queue for gapless playback.
     ///
     /// Must only be sent in response to `PlayerEvent::AboutToFinish`.
     /// Does NOT stop current playback.
     EnqueueNext { url: String, duration: Option<Duration> },
+    /// Gapless prefetch for an offline-cached next track (see [`PlayCached`](Self::PlayCached)).
+    EnqueueNextCached { path: PathBuf, duration: Option<Duration> },
     Pause,
     Resume,
     Stop,
@@ -112,8 +121,8 @@ fn player_thread(cmd_rx: mpsc::Receiver<PlayerCommand>, evt_tx: mpsc::Sender<Pla
     let mut next_queued = false;
     let mut about_to_finish_sent = false;
     let mut prev_elapsed = Duration::ZERO;
-    // Skip-generation counter: updated every time a PlayUrl is received.
-    // Used to discard stale downloads when the user skips rapidly.
+    // Skip-generation counter: updated every time a PlayUrl / PlayCached is received.
+    // Used to discard stale loads when the user skips rapidly.
     let mut skip_gen: u64 = 0;
 
     'outer: loop {
@@ -123,15 +132,38 @@ fn player_thread(cmd_rx: mpsc::Receiver<PlayerCommand>, evt_tx: mpsc::Sender<Pla
             match cmd_rx.try_recv() {
                 Ok(PlayerCommand::Quit) => break 'outer,
                 Ok(PlayerCommand::PlayUrl { url, duration, gen }) => {
-                    // Before downloading, drain any further PlayUrl commands that
-                    // are already queued.  This turns N rapid skips into one fetch.
-                    play_url(
-                        url, duration, gen,
-                        &cmd_rx, &mut skip_gen,
-                        &player, &evt_tx,
-                        &mut current_total, &mut was_playing,
-                        &mut next_total, &mut next_queued,
-                        &mut about_to_finish_sent, &mut prev_elapsed,
+                    play_payload(
+                        PlayPayload::Url(url),
+                        duration,
+                        gen,
+                        &cmd_rx,
+                        &mut skip_gen,
+                        &player,
+                        &evt_tx,
+                        &mut current_total,
+                        &mut was_playing,
+                        &mut next_total,
+                        &mut next_queued,
+                        &mut about_to_finish_sent,
+                        &mut prev_elapsed,
+                        &sample_buffer,
+                    );
+                }
+                Ok(PlayerCommand::PlayCached { path, duration, gen }) => {
+                    play_payload(
+                        PlayPayload::Cached(path),
+                        duration,
+                        gen,
+                        &cmd_rx,
+                        &mut skip_gen,
+                        &player,
+                        &evt_tx,
+                        &mut current_total,
+                        &mut was_playing,
+                        &mut next_total,
+                        &mut next_queued,
+                        &mut about_to_finish_sent,
+                        &mut prev_elapsed,
                         &sample_buffer,
                     );
                 }
@@ -211,16 +243,20 @@ fn player_thread(cmd_rx: mpsc::Receiver<PlayerCommand>, evt_tx: mpsc::Sender<Pla
     drop(device);
 }
 
-/// Handle a `PlayUrl` command with skip-generation cancellation.
+#[derive(Debug, Clone)]
+enum PlayPayload {
+    Url(String),
+    Cached(PathBuf),
+}
+
+/// Handle [`PlayerCommand::PlayUrl`] / [`PlayerCommand::PlayCached`] with skip-generation cancellation.
 ///
-/// Before downloading, drains any further `PlayUrl` commands already queued
-/// in the channel — turning N rapid skips into a single fetch.  After the
-/// (blocking) download, checks the channel once more: if an even newer
-/// `PlayUrl` arrived while we were fetching, the download is discarded and
-/// we recurse for the new one.
+/// Before loading, drains any further play commands already queued — turning N rapid
+/// skips into one fetch/read. After the blocking load, drains again; if a newer play
+/// command arrived mid-load, discards the decoder and recurses.
 #[allow(clippy::too_many_arguments)]
-fn play_url(
-    url: String,
+fn play_payload(
+    payload: PlayPayload,
     duration: Option<Duration>,
     gen: u64,
     cmd_rx: &mpsc::Receiver<PlayerCommand>,
@@ -235,30 +271,39 @@ fn play_url(
     prev_elapsed: &mut Duration,
     sample_buffer: &SampleBuffer,
 ) {
-    // Update skip_gen for this command.
     *skip_gen = gen;
 
-    // ── Pre-download drain ────────────────────────────────────────────────────
-    // Consume any later PlayUrl commands already sitting in the channel.
-    // Non-PlayUrl commands are dropped here; in practice the only commands
-    // that arrive between rapid skips are more PlayUrl commands.
-    let mut final_url = url;
+    // ── Pre-load drain ────────────────────────────────────────────────────────
+    let mut final_payload = payload;
     let mut final_duration = duration;
     let mut final_gen = gen;
     loop {
         match cmd_rx.try_recv() {
-            Ok(PlayerCommand::PlayUrl { url: u, duration: d, gen: g }) => {
-                final_url = u;
+            Ok(PlayerCommand::PlayUrl {
+                url: u,
+                duration: d,
+                gen: g,
+            }) => {
+                final_payload = PlayPayload::Url(u);
                 final_duration = d;
                 final_gen = g;
                 *skip_gen = g;
             }
-            Ok(_other) => break, // non-play command; stop lookahead
+            Ok(PlayerCommand::PlayCached {
+                path: p,
+                duration: d,
+                gen: g,
+            }) => {
+                final_payload = PlayPayload::Cached(p);
+                final_duration = d;
+                final_gen = g;
+                *skip_gen = g;
+            }
+            Ok(_other) => break,
             Err(_) => break,
         }
     }
 
-    // Stop current playback and reset all state before the (slow) fetch.
     player.stop();
     *was_playing = false;
     *next_total = None;
@@ -266,24 +311,43 @@ fn play_url(
     *about_to_finish_sent = false;
     *prev_elapsed = Duration::ZERO;
 
-    // ── Network fetch (blocking) ──────────────────────────────────────────────
-    let source = match download_and_decode(&final_url) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = evt_tx.send(PlayerEvent::Error(format!("playback error: {e}")));
-            return;
-        }
+    // ── Load (network or disk) ──────────────────────────────────────────────
+    let source = match &final_payload {
+        PlayPayload::Url(url) => match download_and_decode(url) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = evt_tx.send(PlayerEvent::Error(format!("playback error: {e}")));
+                return;
+            }
+        },
+        PlayPayload::Cached(path) => match read_cached_and_decode(path) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = evt_tx.send(PlayerEvent::Error(format!("playback error: {e}")));
+                return;
+            }
+        },
     };
 
-    // ── Post-download drain ───────────────────────────────────────────────────
-    // If the user skipped again while we were fetching, discard this result
-    // and handle the newer command instead.
-    let mut newer: Option<(String, Option<Duration>, u64)> = None;
+    // ── Post-load drain ───────────────────────────────────────────────────────
+    let mut newer: Option<(PlayPayload, Option<Duration>, u64)> = None;
     loop {
         match cmd_rx.try_recv() {
-            Ok(PlayerCommand::PlayUrl { url: u, duration: d, gen: g }) => {
+            Ok(PlayerCommand::PlayUrl {
+                url: u,
+                duration: d,
+                gen: g,
+            }) => {
                 *skip_gen = g;
-                newer = Some((u, d, g));
+                newer = Some((PlayPayload::Url(u), d, g));
+            }
+            Ok(PlayerCommand::PlayCached {
+                path: p,
+                duration: d,
+                gen: g,
+            }) => {
+                *skip_gen = g;
+                newer = Some((PlayPayload::Cached(p), d, g));
             }
             Ok(_other) => break,
             Err(_) => break,
@@ -291,22 +355,28 @@ fn play_url(
     }
 
     if *skip_gen != final_gen {
-        // A newer PlayUrl arrived mid-download — discard this source.
         drop(source);
-        if let Some((u, d, g)) = newer {
-            play_url(
-                u, d, g, cmd_rx, skip_gen,
-                player, evt_tx,
-                current_total, was_playing,
-                next_total, next_queued,
-                about_to_finish_sent, prev_elapsed,
+        if let Some((p, d, g)) = newer {
+            play_payload(
+                p,
+                d,
+                g,
+                cmd_rx,
+                skip_gen,
+                player,
+                evt_tx,
+                current_total,
+                was_playing,
+                next_total,
+                next_queued,
+                about_to_finish_sent,
+                prev_elapsed,
                 sample_buffer,
             );
         }
         return;
     }
 
-    // ── Commit ────────────────────────────────────────────────────────────────
     *current_total = final_duration;
     let tapped = SampleTap::new(source, sample_buffer.clone());
     player.append(tapped);
@@ -327,12 +397,24 @@ fn handle_command(
     sample_buffer: &SampleBuffer,
 ) {
     match cmd {
-        PlayerCommand::PlayUrl { .. } => {
-            // Handled by play_url() in the main loop — should not reach here.
-            unreachable!("PlayUrl must be dispatched via play_url()");
+        PlayerCommand::PlayUrl { .. } | PlayerCommand::PlayCached { .. } => {
+            unreachable!("PlayUrl / PlayCached must be dispatched via play_payload()");
         }
         PlayerCommand::EnqueueNext { url, duration } => {
             match download_and_decode(&url) {
+                Ok(source) => {
+                    *next_total = duration;
+                    *next_queued = true;
+                    let tapped = SampleTap::new(source, sample_buffer.clone());
+                    player.append(tapped);
+                }
+                Err(e) => {
+                    let _ = evt_tx.send(PlayerEvent::Error(format!("enqueue error: {e}")));
+                }
+            }
+        }
+        PlayerCommand::EnqueueNextCached { path, duration } => {
+            match read_cached_and_decode(&path) {
                 Ok(source) => {
                     *next_total = duration;
                     *next_queued = true;
@@ -371,7 +453,59 @@ fn handle_command(
 
 // ── Stream + decode ───────────────────────────────────────────────────────────
 
-fn download_and_decode(url: &str) -> Result<Decoder<std::io::Cursor<Vec<u8>>>> {
+/// Shared client: default `get()` uses short timeouts and can truncate large or
+/// slow streams; long tracks need a generous read deadline and occasional retries.
+fn stream_http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            // Whole request including body (large lossless files over slow links).
+            .timeout(Duration::from_secs(900))
+            .connect_timeout(Duration::from_secs(60))
+            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            .user_agent(concat!("playterm/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .expect("stream HTTP client")
+    })
+}
+
+fn fetch_track_bytes(url: &str, accept_identity: bool) -> Result<Vec<u8>> {
+    let mut req = stream_http_client().get(url);
+    if accept_identity {
+        // Some proxies / servers serve odd combinations of Content-Encoding and
+        // body bytes; asking for identity avoids reqwest's decompress errors on
+        // those tracks while still returning raw audio.
+        req = req.header(ACCEPT_ENCODING, "identity");
+    }
+    let response = req.send().context("connecting to stream URL")?;
+    let status = response.status();
+    let response = response
+        .error_for_status()
+        .with_context(|| format!("stream HTTP {status}"))?;
+    let bytes = response
+        .bytes()
+        .context("reading stream body (connection dropped or truncated?)")?;
+    Ok(bytes.to_vec())
+}
+
+fn read_cached_and_decode(path: &std::path::Path) -> Result<Decoder<Cursor<Vec<u8>>>> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading cached track {}", path.display()))?;
+    build_symphonia_decoder(bytes)
+}
+
+fn build_symphonia_decoder(bytes: Vec<u8>) -> Result<Decoder<Cursor<Vec<u8>>>> {
+    let byte_len = bytes.len() as u64;
+    let cursor = Cursor::new(bytes);
+    Decoder::builder()
+        .with_data(cursor)
+        .with_byte_len(byte_len)
+        .with_coarse_seek(true)
+        .build()
+        .context("decoding audio (unsupported or corrupt file?)")
+}
+
+fn download_and_decode(url: &str) -> Result<Decoder<Cursor<Vec<u8>>>> {
     // Download the full track into RAM so symphonia gets an unambiguously
     // seekable Cursor<Vec<u8>>.  StreamingReader over a BufReader was technically
     // seekable but symphonia's demuxer cached seekability as false during probe,
@@ -381,13 +515,17 @@ fn download_and_decode(url: &str) -> Result<Decoder<std::io::Cursor<Vec<u8>>>> {
     //   is_seekable = true internally.
     // with_coarse_seek: bypasses the time_base requirement for accurate seeking
     //   (unavailable on transcoded MP3 streams); seeks to the nearest keyframe.
-    let bytes = reqwest::blocking::get(url)?.bytes()?;
-    let byte_len = bytes.len() as u64;
-    let cursor = std::io::Cursor::new(bytes.to_vec());
-    let decoder = Decoder::builder()
-        .with_data(cursor)
-        .with_byte_len(byte_len)
-        .with_coarse_seek(true)
-        .build()?;
-    Ok(decoder)
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..4u32 {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(200 * u64::from(attempt)));
+        }
+        // After a few normal tries (compressed transfer), ask for identity once.
+        let identity = attempt == 3;
+        match fetch_track_bytes(url, identity).and_then(build_symphonia_decoder) {
+            Ok(decoder) => return Ok(decoder),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("loop runs at least once"))
 }
