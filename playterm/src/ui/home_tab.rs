@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -5,11 +6,15 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
+use ratatui_image::picker::ProtocolType;
+use ratatui_image::StatefulImage;
 
-use crate::app::{HomeSection, HomeState, RecentAlbum};
+use crate::app::{App, HomeSection, HomeState, RecentAlbum};
 use crate::config::{Config, HomePanel};
 use crate::theme::Theme;
-use crate::ui::kitty_art::{art_strip_thumbnail_size, visible_thumbnail_count};
+use crate::ui::kitty_art::{
+    art_strip_layout, KITTY_STRIP_MAX_SLOTS, STRIP_GAP_COLS,
+};
 
 // ── Relative time formatting ──────────────────────────────────────────────────
 
@@ -45,6 +50,7 @@ fn titled_block<'a>(title: &'a str, is_active: bool, accent: Color, theme: &Them
         )
     };
     Block::default()
+        .style(Style::default().bg(theme.surface))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(border_style)
@@ -141,34 +147,29 @@ pub fn compute_home_layout(area: Rect, cfg: &Config) -> Option<HomeLayout> {
 
 // ── Top-level render ──────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 pub fn render_home_tab(
     f: &mut Frame,
     area: Rect,
-    home: &HomeState,
-    cfg: &Config,
+    app: &mut App,
     accent: Color,
-    kitty_supported: bool,
     help_visible: bool,
-    cell_px: Option<(u16, u16)>,
-    theme: &Theme,
 ) {
+    let cfg = &app.config;
+    let theme = app.theme.clone();
     let Some(layout) = compute_home_layout(area, cfg) else {
         return;
     };
 
-    let show_album_art = cfg.home_recent_albums_show_art;
-    let use_kitty_art = kitty_supported && !help_visible && show_album_art;
+    let use_strip_graphics = app.home_strip_graphics_wanted(help_visible);
 
     render_home_panel(
         f,
         layout.top,
         layout.top_panel,
-        home,
+        app,
         accent,
-        use_kitty_art,
-        cell_px,
-        theme,
+        use_strip_graphics,
+        &theme,
     );
 
     if layout.bottom_h == 0 {
@@ -179,21 +180,19 @@ pub fn render_home_tab(
         f,
         layout.bottom_left,
         layout.bottom_left_panel,
-        home,
+        app,
         accent,
-        use_kitty_art,
-        cell_px,
-        theme,
+        use_strip_graphics,
+        &theme,
     );
     render_home_panel(
         f,
         layout.bottom_right,
         layout.bottom_right_panel,
-        home,
+        app,
         accent,
-        use_kitty_art,
-        cell_px,
-        theme,
+        use_strip_graphics,
+        &theme,
     );
 }
 
@@ -201,125 +200,243 @@ fn render_home_panel(
     f: &mut Frame,
     area: Rect,
     panel: HomePanel,
-    home: &HomeState,
+    app: &mut App,
     accent: Color,
-    use_kitty_art: bool,
-    cell_px: Option<(u16, u16)>,
+    use_strip_graphics: bool,
     theme: &Theme,
 ) {
+    let cell_px = app.cell_px;
     match panel {
         HomePanel::RecentAlbums => {
-            let is_active = home.active_section == HomeSection::RecentAlbums;
+            let is_active = app.home.active_section == HomeSection::RecentAlbums;
             let albums_block = titled_block(" Recently Played ", is_active, accent, theme);
             let albums_inner = albums_block.inner(area);
+            app.home_recent_albums_inner = Some(albums_inner);
             f.render_widget(albums_block, area);
 
-            if use_kitty_art {
-                // NOTE: render_art_strip (heavy) is driven from main.rs via `home_art_needs_redraw`.
-                render_art_strip_labels(f, albums_inner, home, accent, cell_px, is_active);
+            if use_strip_graphics {
+                if app.legacy_kitty_graphics_ready() || app.ratatui_uses_kitty_apc() {
+                    // Kitty strip images are drawn after `terminal.draw` in main.rs.
+                    render_art_strip_labels(f, albums_inner, &app.home, accent, cell_px, is_active);
+                } else if app.ratatui_art_ready() {
+                    render_art_strip_ratatui(f, albums_inner, app, is_active);
+                    render_art_strip_labels(f, albums_inner, &app.home, accent, cell_px, is_active);
+                }
             } else {
                 render_art_strip_text_fallback(
                     f,
                     albums_inner,
-                    &home.recent_albums,
-                    home.album_selected_index,
+                    &app.home.recent_albums,
+                    app.home.album_selected_index,
                     accent,
                     is_active,
                 );
             }
         }
         HomePanel::RecentTracks => {
-            render_recent_tracks_block(f, area, home, accent, theme);
+            render_recent_tracks_block(f, area, &app.home, accent, theme);
         }
         HomePanel::Rediscover => {
-            render_rediscover_block(f, area, home, accent, theme);
+            render_rediscover_block(f, area, &app.home, accent, theme);
         }
     }
 }
 
+fn render_art_strip_ratatui(
+    f: &mut Frame,
+    albums_inner: Rect,
+    app: &mut App,
+    _is_active: bool,
+) {
+    // Keep ratatui-image pad color aligned with panel bg (ImageSource copies this at `new_resize_protocol`).
+    // If a rare cover still shows wrong matte vs panel: often PNG alpha / encoder quantization — revisit with a sample file.
+    if let Some(p) = app.art_picker.as_mut() {
+        p.set_background_color(crate::theme::color_to_rgba(app.theme.surface));
+    }
+    let Some(picker) = app.art_picker.as_ref() else {
+        return;
+    };
+    if albums_inner.height < 3 {
+        return;
+    }
+    let layout = art_strip_layout(albums_inner.width, albums_inner.height);
+    let visible_count = layout.total_visible.min(KITTY_STRIP_MAX_SLOTS);
+
+    let is_sixel = matches!(picker.protocol_type(), ProtocolType::Sixel);
+    // Sixel: contain + pad to encode size (full cover); halfblocks/Kitty APC strip: crop + super-res.
+    let img_resize = app.ratatui_stateful_resize_strip();
+    // Sixel encode runs on the main thread; rebuilding the whole strip in one `draw` stalls the UI.
+    const MAX_SIXEL_STRIP_BUILDS_PER_FRAME: usize = 3;
+    let mut sixel_builds_this_frame = 0usize;
+    let mut keep = HashSet::new();
+
+    for i in 0..visible_count {
+        let album_index = app.home.album_scroll_offset + i;
+        if album_index >= app.home.recent_albums.len() {
+            break;
+        }
+        let album_id = app.home.recent_albums[album_index].album_id.clone();
+        keep.insert(album_id.clone());
+
+        let row_in_grid = (i / layout.per_row) as u16;
+        let col_in_grid = (i % layout.per_row) as u16;
+        let thumb_cols = layout.thumb_cols;
+        let thumb_rows = layout.thumb_rows;
+        let col = albums_inner
+            .x
+            .saturating_add(layout.pad_x)
+            .saturating_add(col_in_grid * (thumb_cols + STRIP_GAP_COLS));
+        let row = albums_inner
+            .y
+            .saturating_add(layout.thumb_row_top_dy(row_in_grid));
+        let thumb_rect = Rect {
+            x: col,
+            y: row,
+            width: thumb_cols,
+            height: thumb_rows,
+        };
+
+        if let Some(bytes) = app.home_art_cache.get(&album_id) {
+            let cells = (thumb_cols, thumb_rows);
+            if app.home_strip_last_cells.get(&album_id).copied() != Some(cells) {
+                app.home_strip_art.remove(&album_id);
+            }
+            if !app.home_strip_art.contains_key(&album_id) {
+                if is_sixel && sixel_builds_this_frame >= MAX_SIXEL_STRIP_BUILDS_PER_FRAME {
+                    continue;
+                }
+                // Must match `Picker`'s font size: `new_resize_protocol` builds `ImageSource` with
+                // `picker.font_size()`. Using `cell_px` here skews bitmap aspect vs. ratatui's cell
+                // math so `render_area` can under-fill the thumb (black band / stale matte size).
+                let fs = picker.font_size();
+                if let Ok(img) = image::load_from_memory(bytes) {
+                    let img = if is_sixel {
+                        let pad = crate::theme::color_to_rgba(app.theme.surface);
+                        let fw = fs.0 as u32;
+                        let fh = fs.1 as u32;
+                        let need_w = thumb_rect.width as u32 * fw;
+                        let need_h = thumb_rect.height as u32 * fh;
+                        if (need_w as u128).saturating_mul(need_h as u128)
+                            <= crate::ui::art_prepare::MAX_SIXEL_PREP_PIXELS
+                        {
+                            crate::ui::art_prepare::prepare_art_image_for_exact_pixels_contain_centered(
+                                img, need_w, need_h, pad,
+                            )
+                        } else {
+                            crate::ui::art_prepare::prepare_art_image_for_rect_contain_centered(
+                                img, thumb_rect, fs, pad,
+                            )
+                        }
+                    } else {
+                        crate::ui::art_prepare::prepare_art_image_for_strip(img, thumb_rect, fs)
+                    };
+                    let proto = picker.new_resize_protocol(img);
+                    app.home_strip_art.insert(album_id.clone(), proto);
+                    app.home_strip_last_cells.insert(album_id.clone(), cells);
+                    if is_sixel {
+                        sixel_builds_this_frame += 1;
+                    }
+                }
+            }
+            if let Some(state) = app.home_strip_art.get_mut(&album_id) {
+                if is_sixel {
+                    // Fill thumb cells with panel surface before sixel; avoids default (black) showing
+                    // beside letterboxed square art when the bitmap matte differs from terminal cells.
+                    f.render_widget(
+                        Block::default().style(Style::default().bg(app.theme.surface)),
+                        thumb_rect,
+                    );
+                }
+                let w = StatefulImage::default().resize(img_resize.clone());
+                f.render_stateful_widget(w, thumb_rect, state);
+            }
+        }
+    }
+
+    app.home_strip_art.retain(|k, _| keep.contains(k));
+    app.home_strip_last_cells.retain(|k, _| keep.contains(k));
+}
+
 // ── Art strip label rows (Kitty path) ─────────────────────────────────────────
 
-/// Render album name + artist name text rows below the Kitty thumbnails,
-/// inside the inner area of the Recently Played block.
+/// Render album + artist text **under each row of thumbnails** (centered strip, per-column cells).
 fn render_art_strip_labels(
     f: &mut Frame,
     inner: Rect,
     home: &HomeState,
     accent: Color,
-    cell_px: Option<(u16, u16)>,
+    _cell_px: Option<(u16, u16)>,
     is_active: bool,
 ) {
     if inner.height < 3 {
         return;
     }
 
-    let thumb_area_h = inner.height.saturating_sub(2).max(1);
-    let (thumb_cols, _) = art_strip_thumbnail_size(cell_px, thumb_area_h);
-    let visible_count = visible_thumbnail_count(inner.width, thumb_cols, 1);
+    let layout = art_strip_layout(inner.width, inner.height);
+    let visible_count = layout.total_visible.min(KITTY_STRIP_MAX_SLOTS);
+    let thumb_cols = layout.thumb_cols;
 
-    // Album name row: 1 row below the thumbnail strip.
-    let name_row_y = inner.y + thumb_area_h;
-    // Artist name row: 1 row below the album name row.
-    let artist_row_y = name_row_y + 1;
-
-    if name_row_y >= inner.y + inner.height {
-        return;
-    }
-
-    let mut name_spans: Vec<Span> = Vec::new();
-    let mut artist_spans: Vec<Span> = Vec::new();
-
-    for i in 0..visible_count {
-        let album_index = home.album_scroll_offset + i;
-        if album_index >= home.recent_albums.len() {
+    for row_in_grid in 0u16..layout.grid_rows {
+        let name_row_y = inner.y.saturating_add(layout.album_label_top_dy(row_in_grid));
+        let artist_row_y = name_row_y + 1;
+        if name_row_y >= inner.y + inner.height {
             break;
         }
-        let album = &home.recent_albums[album_index];
-        let is_selected = is_active && album_index == home.album_selected_index;
 
-        // Each label cell is `thumb_cols` wide (+ 1 gap, except last).
-        let label_width = thumb_cols as usize;
-        let name_label  = pad_or_truncate(&album.album_name, label_width);
-        let artist_label = pad_or_truncate(&album.artist_name, label_width);
+        for col_in_grid in 0..layout.per_row {
+            let slot = row_in_grid as usize * layout.per_row + col_in_grid;
+            if slot >= visible_count {
+                break;
+            }
+            let album_index = home.album_scroll_offset + slot;
+            if album_index >= home.recent_albums.len() {
+                break;
+            }
+            let album = &home.recent_albums[album_index];
+            let is_selected = is_active && album_index == home.album_selected_index;
 
-        let (name_style, artist_style) = if is_selected {
-            (
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                Style::default().fg(accent),
-            )
-        } else {
-            (
-                Style::default().fg(Color::Gray),
-                Style::default().fg(Color::DarkGray),
-            )
-        };
+            let label_width = thumb_cols as usize;
+            let name_label = pad_or_truncate(&album.album_name, label_width);
+            let artist_label = pad_or_truncate(&album.artist_name, label_width);
 
-        name_spans.push(Span::styled(name_label, name_style));
-        name_spans.push(Span::raw(" ")); // gap
-        artist_spans.push(Span::styled(artist_label, artist_style));
-        artist_spans.push(Span::raw(" ")); // gap
-    }
+            let (name_style, artist_style) = if is_selected {
+                (
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent),
+                )
+            } else {
+                (
+                    Style::default().fg(Color::Gray),
+                    Style::default().fg(Color::DarkGray),
+                )
+            };
 
-    f.render_widget(
-        Paragraph::new(Line::from(name_spans)),
-        Rect {
-            x: inner.x,
-            y: name_row_y,
-            width: inner.width,
-            height: 1,
-        },
-    );
+            let col_x = inner
+                .x
+                .saturating_add(layout.pad_x)
+                .saturating_add((col_in_grid as u16) * (thumb_cols + STRIP_GAP_COLS));
 
-    if artist_row_y < inner.y + inner.height {
-        f.render_widget(
-            Paragraph::new(Line::from(artist_spans)),
-            Rect {
-                x: inner.x,
-                y: artist_row_y,
-                width: inner.width,
-                height: 1,
-            },
-        );
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(name_label, name_style))),
+                Rect {
+                    x: col_x,
+                    y: name_row_y,
+                    width: thumb_cols,
+                    height: 1,
+                },
+            );
+            if artist_row_y < inner.y + inner.height {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(artist_label, artist_style))),
+                    Rect {
+                        x: col_x,
+                        y: artist_row_y,
+                        width: thumb_cols,
+                        height: 1,
+                    },
+                );
+            }
+        }
     }
 }
 

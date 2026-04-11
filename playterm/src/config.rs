@@ -3,6 +3,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// How album art is rendered in the terminal (Now Playing column + Home strip).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AlbumArtBackend {
+    /// Multi-protocol rendering via `ratatui-image` (Kitty, Sixel, iTerm2, half-blocks, …).
+    #[default]
+    RatatuiImage,
+    /// Original Kitty APC + post-draw path (for side-by-side testing).
+    KittyLegacy,
+}
+
 // ── File-level serde structs ──────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -40,6 +51,13 @@ pub struct KeybindsSection {
     pub seek_backward: Option<String>,
     pub add_track:     Option<String>,
     pub add_all:       Option<String>,
+    /// Replace queue with the **current album** (Browser). Default: Ctrl+r
+    #[serde(alias = "add_all_replace")]
+    pub add_all_replace_album: Option<String>,
+    /// Replace queue with **all tracks for the current artist** (Browser). Default: Ctrl+Shift+r
+    pub add_all_replace_artist: Option<String>,
+    /// Prepend artist/album tracks to the queue. Default: Ctrl+Shift+p
+    pub add_all_prepend: Option<String>,
     pub shuffle:       Option<String>,
     pub unshuffle:     Option<String>,
     pub clear_queue:   Option<String>,
@@ -58,8 +76,26 @@ pub struct KeybindsSection {
     pub quit:               Option<String>,
     /// Fuzzy track picker (metadata index). Default: Ctrl+f
     pub library_fzf:        Option<String>,
-    /// Force library index refresh. Default: Ctrl+r
+    /// Force library index refresh. Default: Ctrl+g
     pub library_refresh:    Option<String>,
+    /// Toggle this help popup. Default: i
+    pub toggle_help: Option<String>,
+    /// Toggle dynamic accent from album art. Default: t
+    pub toggle_dynamic_theme: Option<String>,
+    /// Toggle lyrics overlay. Default: Shift+l (`L` in TOML is fine)
+    pub toggle_lyrics: Option<String>,
+    /// Toggle spectrum visualizer. Default: Shift+v (bare `V` still works in-app)
+    pub toggle_visualizer: Option<String>,
+    /// Browser: playlist overlay. Default: Shift+p
+    pub playlist_overlay: Option<String>,
+    /// Browser: add track to playlist. Default: >
+    pub browser_add_to_playlist: Option<String>,
+    /// Home: next panel section. Default: Shift+j (`J` in TOML is fine)
+    pub home_section_next: Option<String>,
+    /// Home: previous panel section. Default: Shift+k
+    pub home_section_prev: Option<String>,
+    /// Home: re-roll / refresh. Default: r
+    pub home_refresh: Option<String>,
 }
 
 // ── [theme] ───────────────────────────────────────────────────────────────────
@@ -116,10 +152,10 @@ pub struct LibrarySection {
     #[serde(default = "default_library_fetch_artist_parallelism")]
     pub fetch_artist_parallelism: usize,
     /// Navidrome only: if the on-disk index was built after the same library scan as
-    /// `getScanStatus.lastScan`, skip the full API walk (still obeys Ctrl+r force refresh).
+    /// `getScanStatus.lastScan`, skip the full API walk (still obeys forced index refresh).
     #[serde(default)]
     pub navidrome_skip_unchanged_scan: bool,
-    /// After a forced index refresh (Ctrl+r), send a desktop notification (FreeDesktop
+    /// After a forced index refresh, send a desktop notification (FreeDesktop
     /// `notify-send` protocol). Default: true.
     #[serde(default = "default_library_notify_on_forced_refresh")]
     pub notify_on_forced_index_refresh: bool,
@@ -331,6 +367,10 @@ pub struct UiHomeRecentAlbumsSection {
     /// When false, Home uses text-only recently played (no Kitty art strip).
     #[serde(default)]
     pub show_art: Option<bool>,
+    /// `getCoverArt` `size` (max edge px) for Home strip downloads. Smaller = faster network + decode.
+    /// `0` = request full-size art (slowest). Default when omitted: 320.
+    #[serde(default)]
+    pub cover_fetch_max_px: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -428,6 +468,9 @@ pub struct UiSection {
     /// NowPlaying tab: show the album-art column (placeholder today). Default: true.
     #[serde(default = "default_ui_nowplaying_show_art")]
     pub nowplaying_show_art: bool,
+    /// `ratatui-image` (default) vs legacy Kitty-only APC renderer.
+    #[serde(default)]
+    pub album_art_backend: AlbumArtBackend,
     /// NowPlaying tab: album art column side. Use `left` or `right` (case-insensitive; default: left).
     #[serde(default = "default_ui_nowplaying_art_position")]
     pub nowplaying_art_position: String,
@@ -523,6 +566,7 @@ impl Default for UiSection {
             queue_template: String::new(),
             progress_style: default_ui_progress_style(),
             nowplaying_show_art: default_ui_nowplaying_show_art(),
+            album_art_backend: AlbumArtBackend::default(),
             nowplaying_art_position: default_ui_nowplaying_art_position(),
             nowplaying_art_width_percent: default_ui_nowplaying_art_width_percent(),
             show_fzf_hint: default_ui_show_fzf_hint(),
@@ -690,6 +734,7 @@ pub struct Config {
     pub progress_style: String,
     /// NowPlaying tab: show the album-art column.
     pub nowplaying_show_art: bool,
+    pub album_art_backend: AlbumArtBackend,
     /// NowPlaying tab: album art side ("left" or "right").
     pub nowplaying_art_position: String,
     /// NowPlaying tab: album art width percentage.
@@ -732,6 +777,8 @@ pub struct Config {
     pub library_notify_on_forced_index_refresh: bool,
     /// Home tab: show Kitty thumbnails in Recently Played when supported.
     pub home_recent_albums_show_art: bool,
+    /// Subsonic `getCoverArt` `size` for Home strip (0 = full resolution from server).
+    pub home_cover_fetch_max_px: u32,
     /// Home tab: top band height as percent of the content area (25–75).
     pub home_top_height_percent: u8,
     /// Home tab: `[top, bottom_left, bottom_right]` panel assignment.
@@ -920,6 +967,14 @@ impl Config {
             .and_then(|h| h.recent_albums.as_ref())
             .and_then(|r| r.show_art)
             .unwrap_or(true);
+        let home_cover_fetch_max_px = match ht
+            .and_then(|h| h.recent_albums.as_ref())
+            .and_then(|r| r.cover_fetch_max_px)
+        {
+            None => 320,
+            Some(0) => 0,
+            Some(n) => n.clamp(64, 2048),
+        };
         let home_top_height_percent = ht
             .and_then(|h| h.layout.as_ref())
             .and_then(|l| l.top_height_percent)
@@ -953,6 +1008,7 @@ impl Config {
             queue_template,
             progress_style,
             nowplaying_show_art,
+            album_art_backend: ui.album_art_backend,
             nowplaying_art_position,
             nowplaying_art_width_percent,
             show_fzf_hint,
@@ -979,6 +1035,7 @@ impl Config {
             library_navidrome_skip_unchanged_scan: file_cfg.library.navidrome_skip_unchanged_scan,
             library_notify_on_forced_index_refresh: file_cfg.library.notify_on_forced_index_refresh,
             home_recent_albums_show_art,
+            home_cover_fetch_max_px,
             home_top_height_percent,
             home_panels,
             browse_mode,
@@ -1039,27 +1096,45 @@ max_bit_rate = 0   # 0 = unlimited; set e.g. 320 to cap streaming bitrate
 # mpris = true     # Linux: register on session D-Bus for media keys / playerctl (default: true)
 
 [keybinds]
+# Shift+letter: use "Shift+n" or "N" (same). Helps Ghostty/kitty vs. classic terminals.
 # scroll_up     = "k"
 # scroll_down   = "j"
 # column_left   = "h"
 # column_right  = "l"
 # play_pause    = "p"
 # next_track    = "n"
-# prev_track    = "N"
+# prev_track    = "Shift+n"
 # seek_forward  = "Right"
 # seek_backward = "Left"
 # add_track     = "a"
 # add_all       = "Shift+a"
+# add_all_replace_album  = "Ctrl+r"
+# add_all_replace_artist = "Ctrl+Shift+r"
+# add_all_prepend  = "Ctrl+Shift+p"
+# add_all_replace  = "Ctrl+r"       # legacy alias for add_all_replace_album
 # shuffle       = "x"
 # unshuffle     = "z"
-# clear_queue   = "D"
+# clear_queue   = "Shift+d"
 # search        = "/"
 # volume_up     = "+"
 # volume_down   = "-"
 # tab_switch    = "Tab"
+# tab_switch_reverse = "`"
+# go_to_home    = "1"
+# go_to_browser = "2"
+# go_to_nowplaying = "3"
 # quit          = "q"
-# library_fzf     = "Ctrl+f"   # fuzzy track picker; "" disables
-# library_refresh = "Ctrl+r"   # force full index refresh; "" disables
+# library_fzf     = "Ctrl+f"
+# library_refresh = "Ctrl+g"
+# toggle_help = "i"
+# toggle_dynamic_theme = "t"
+# toggle_lyrics = "Shift+l"
+# toggle_visualizer = "Shift+v"
+# playlist_overlay = "Shift+p"
+# browser_add_to_playlist = ">"
+# home_section_next = "Shift+j"
+# home_section_prev = "Shift+k"
+# home_refresh = "r"
 
 [theme]
 # accent        = "#ff8c00"   # highlighted items, active borders, progress fill
@@ -1072,6 +1147,7 @@ max_bit_rate = 0   # 0 = unlimited; set e.g. 320 to cap streaming bitrate
 # dynamic       = true         # extract accent colour from album art
 
 [ui]
+# album_art_backend = "kitty-legacy"   # default: "ratatui-image"; legacy Kitty APC + post-draw
 
 [ui.general]
 tab_bar_position = "bottom"
@@ -1089,6 +1165,7 @@ progress_style = "██░"
 
 [ui.hometab.recent_albums]
 show_art = true
+# cover_fetch_max_px = 320   # getCoverArt size (0 = full image; lower = faster)
 
 [ui.hometab.layout]
 top_height_percent = 50
@@ -1128,7 +1205,7 @@ location = "queue"
 # fetch_album_parallelism = 12    # concurrent getAlbum per artist during index refresh
 # fetch_artist_parallelism = 4    # concurrent artists during index refresh
 # navidrome_skip_unchanged_scan = false   # Navidrome: skip full walk when lastScan unchanged
-# notify_on_forced_index_refresh = true   # desktop notification when Ctrl+r refresh finishes
+# notify_on_forced_index_refresh = true   # desktop notification when forced refresh finishes
 
 [cache]
 enabled     = true

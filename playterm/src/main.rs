@@ -37,9 +37,9 @@ use ratatui::Terminal;
 
 use action::{Action, Direction};
 use app::{App, BrowserColumn, Tab};
-use config::{Config, HomePanel};
+use config::{AlbumArtBackend, Config, HomePanel};
 use keybinds::Keybinds;
-use state::{PlaylistFocus, PlaylistInputMode};
+use state::{GlobalConfirm, PlaylistFocus, PlaylistInputMode};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,20 +55,22 @@ async fn main() -> Result<()> {
         app.tmux_status_offset = tmux_status_offset();
     }
 
-    // Detect Kitty graphics support before entering raw mode / alternate screen.
-    // Inside tmux the probe fails — tmux intercepts the APC response before it
-    // reaches us. Assume the outer terminal supports Kitty when in_tmux is true;
-    // the user would not have enabled passthrough otherwise.
-    app.kitty_supported = if app.in_tmux {
-        true
-    } else {
-        ui::kitty_art::detect_kitty_support()
-    };
-
-    // Query cell pixel dimensions (used for art strip sizing).
-    // Attempted only if Kitty is supported — non-Kitty terminals may not respond.
-    if app.kitty_supported {
-        app.cell_px = ui::kitty_art::query_cell_pixel_size();
+    // Legacy Kitty path: probe before raw mode / alternate screen (see `kitty_art`).
+    // `ratatui-image` uses `Picker::from_query_stdio()` after the alternate screen.
+    match app.config.album_art_backend {
+        AlbumArtBackend::KittyLegacy => {
+            app.kitty_supported = if app.in_tmux {
+                true
+            } else {
+                ui::kitty_art::detect_kitty_support()
+            };
+            if app.legacy_kitty_graphics_ready() {
+                app.cell_px = ui::kitty_art::query_cell_pixel_size();
+            }
+        }
+        AlbumArtBackend::RatatuiImage => {
+            app.kitty_supported = false;
+        }
     }
 
     // Restore previous session state (selections, queue) before first render.
@@ -81,6 +83,13 @@ async fn main() -> Result<()> {
     match history::PlayHistory::load(&history_path) {
         Ok(h) => app.history = h,
         Err(e) => eprintln!("warn: could not load history: {e}"),
+    }
+
+    // `refresh_home_data()` only ran when navigating to Home — not on cold start. If we restore
+    // or default to Home, populate lists and kick art fetches before the first frame.
+    if app.active_tab == Tab::Home {
+        app.refresh_home_data();
+        app.home_art_needs_redraw = true;
     }
 
     // Begin fetching artists immediately.
@@ -129,6 +138,32 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    if matches!(app.config.album_art_backend, AlbumArtBackend::RatatuiImage) {
+        // Offload NP resize+encode (Sixel etc.) so tab switches are not blocked on the main thread.
+        let (tx_job, rx_job) = std::sync::mpsc::channel::<ratatui_image::thread::ResizeRequest>();
+        let (tx_done, rx_done) = std::sync::mpsc::channel::<
+            Result<ratatui_image::thread::ResizeResponse, ratatui_image::errors::Errors>,
+        >();
+        std::thread::spawn(move || {
+            while let Ok(req) = rx_job.recv() {
+                let _ = tx_done.send(req.resize_encode());
+            }
+        });
+        app.ratatui_resize_tx = Some(tx_job);
+        app.ratatui_resize_rx = Some(rx_done);
+
+        match ratatui_image::picker::Picker::from_query_stdio() {
+            Ok(mut p) => {
+                p.set_background_color(theme::color_to_rgba(app.theme.surface));
+                app.cell_px = Some(p.font_size());
+                app.art_picker = Some(p);
+            }
+            Err(e) => {
+                eprintln!("warn: album art (ratatui-image): terminal query failed: {e}");
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     let mpris_ctrl_rx = if let Some((link, rx)) = mpris::setup(app.config.mpris_enabled) {
         app.mpris = Some(link);
@@ -147,8 +182,8 @@ async fn main() -> Result<()> {
         m.shutdown();
     }
 
-    // Clear any Kitty images before leaving the alternate screen.
-    if app.kitty_supported {
+    // Clear any Kitty APC placements before leaving the alternate screen.
+    if app.kitty_apc_overlay_active() {
         let _ = ui::kitty_art::clear_image(app.in_tmux);
     }
 
@@ -186,11 +221,13 @@ async fn main() -> Result<()> {
 fn run_library_fzf_picker(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    last_rendered_art: &mut Option<(String, Rect)>,
+    last_rendered_art: &mut Option<(u64, Rect)>,
     art_displayed: &mut bool,
 ) -> anyhow::Result<()> {
     use crate::fzf_picker;
     use crate::library_index;
+
+    app.pending_gg = false;
 
     if !app.config.library_index_enabled {
         app.flash_status("Library index is disabled in config");
@@ -201,7 +238,7 @@ fn run_library_fzf_picker(
         return Ok(());
     }
     if app.library_index_tracks.is_empty() {
-        app.flash_status("Library index empty — wait for refresh or press Ctrl+r");
+        app.flash_status("Library index empty — wait for refresh or use the index refresh shortcut (default Ctrl+g)");
         return Ok(());
     }
 
@@ -220,13 +257,16 @@ fn run_library_fzf_picker(
     if let Err(e) = terminal.clear() {
         eprintln!("terminal clear after fzf: {e}");
     }
-    if app.kitty_supported {
+    if app.kitty_apc_overlay_active() {
         let _ = ui::kitty_art::clear_image(app.in_tmux);
         *last_rendered_art = None;
         *art_displayed = false;
         if app.active_tab == Tab::Home {
             app.home_art_needs_redraw = true;
         }
+    }
+    if app.ratatui_art_ready() && !app.ratatui_uses_kitty_apc() {
+        app.clear_ratatui_art_state();
     }
     match res {
         Ok(Some(lines)) => {
@@ -245,21 +285,39 @@ fn run_library_fzf_picker(
     Ok(())
 }
 
+/// Merge completed Now Playing `ThreadProtocol` encodes from the worker thread.
+fn drain_ratatui_np_resize_completions(app: &mut App) {
+    let Some(rx) = app.ratatui_resize_rx.as_ref() else {
+        return;
+    };
+    while let Ok(done) = rx.try_recv() {
+        match done {
+            Ok(res) => {
+                if let Some(np) = app.np_art_state.as_mut() {
+                    let _ = np.update_resized_protocol(res);
+                }
+            }
+            Err(e) => eprintln!("now playing art: {e}"),
+        }
+    }
+}
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     signal_quit: Arc<AtomicBool>,
     mpris_ctrl_rx: Option<std::sync::mpsc::Receiver<crate::mpris::MprisControl>>,
 ) -> Result<()> {
-    // `last_rendered_art` — the (cover_id, rect) of the last full image
+    // `last_rendered_art` — the (bytes_digest, rect) of the last full image
     // transmission.  Kept across tab switches so we can detect whether a
-    // re-transmit is actually needed.
+    // re-transmit is actually needed (digest matches identical pixels even if
+    // `cover_id` differs per track).
     //
     // `art_displayed` — whether the image is currently visible on screen.
     // Set to false when switching away (ratatui overwrites those cells) but we
     // deliberately do NOT clear the image from the terminal's store, so we can
     // redisplay it instantly with `a=p,i=1` when switching back.
-    let mut last_rendered_art: Option<(String, Rect)> = None;
+    let mut last_rendered_art: Option<(u64, Rect)> = None;
     let mut art_displayed = false;
     // Cover id for which `render_image` failed (e.g. undecodable bytes). Without
     // this latch the loop retries every frame and spams stderr.
@@ -300,10 +358,27 @@ async fn run_loop(
         // Expire status flash messages.
         app.tick_status_flash();
 
+        // Apply completed NP encodes before draw (previous frame) and after draw (same-frame worker).
+        drain_ratatui_np_resize_completions(app);
+
         terminal.draw(|f| ui::render(app, f))?;
 
-        // ── Kitty album art (rendered after ratatui so it sits above text) ──────
-        if app.kitty_supported {
+        app.apply_home_strip_resize_settle();
+
+        drain_ratatui_np_resize_completions(app);
+
+        if app.ratatui_art_ready() && !app.ratatui_uses_kitty_apc() {
+            for (_id, st) in app.home_strip_art.iter_mut() {
+                if let Some(r) = st.last_encoding_result() {
+                    if let Err(e) = r {
+                        eprintln!("home strip art: {e}");
+                    }
+                }
+            }
+        }
+
+        // ── Kitty APC album art (rendered after ratatui so it sits above text) ─
+        if app.kitty_apc_overlay_active() {
             if app.active_tab == app::Tab::NowPlaying {
                 // New cover id → drop any "unrenderable" latch from a previous track.
                 match (&app.art_cache, &kitty_cover_unrenderable) {
@@ -329,7 +404,9 @@ async fn run_loop(
                         let _ = ui::kitty_art::clear_image(app.in_tmux);
                         art_displayed = false;
                     }
-                } else if let Some((cover_id, bytes)) = &app.art_cache {
+                } else if let (Some((cover_id, bytes)), Some(fp)) =
+                    (app.art_cache.as_ref(), app.art_cache_fingerprint)
+                {
                     let sz = terminal.size()?;
                     let show_art = app.config.nowplaying_show_art;
                     let art_right = app
@@ -385,7 +462,7 @@ async fn run_loop(
                         } else {
                             let stored_matches = last_rendered_art
                                 .as_ref()
-                                .map(|(id, r)| id == cover_id && r == &placement)
+                                .map(|(last_fp, r)| *last_fp == fp && r == &placement)
                                 .unwrap_or(false);
 
                             if stored_matches && art_displayed {
@@ -398,9 +475,11 @@ async fn run_loop(
                                     placement,
                                     app.in_tmux,
                                     app.tmux_status_offset,
+                                    app.cell_px,
+                                    crate::theme::color_to_rgba(app.theme.surface),
                                 ) {
                                     Ok(()) => {
-                                        last_rendered_art = Some((cover_id.clone(), placement));
+                                        last_rendered_art = Some((fp, placement));
                                         art_displayed = true;
                                     }
                                     Err(e) => {
@@ -441,32 +520,21 @@ async fn run_loop(
                 && app.active_tab == app::Tab::Home
                 && !app.help_visible
             {
-                let sz = terminal.size()?;
-                let area = Rect::new(0, 0, sz.width, sz.height);
-                // Replicate the strip area used in home_tab.rs render.
-                let content_area = ui::layout::build_layout(area, &ui::layout::layout_options_for_app(app)).center;
-                let half = (content_area.height / 2).max(3);
-                let top_area = Rect { height: half, ..content_area };
-                // albums_inner = top_area inset by 1 on each side (block border).
-                let albums_inner = Rect {
-                    x: top_area.x + 1,
-                    y: top_area.y + 1,
-                    width: top_area.width.saturating_sub(2),
-                    height: top_area.height.saturating_sub(2),
-                };
-                let thumb_area_h = albums_inner.height.saturating_sub(2).max(1);
-                let strip_rect = Rect { height: thumb_area_h, ..albums_inner };
-                ui::kitty_art::render_art_strip(
-                    &app.home.recent_albums,
-                    app.home.album_scroll_offset,
-                    app.home.album_selected_index,
-                    &app.home_art_cache,
-                    strip_rect,
-                    app.cell_px,
-                    albums_inner.x,
-                    albums_inner.y,
-                    app.in_tmux,
-                );
+                if let Some(albums_inner) = app.home_recent_albums_inner {
+                    ui::kitty_art::render_art_strip(
+                        &app.home.recent_albums,
+                        app.home.album_scroll_offset,
+                        app.home.album_selected_index,
+                        &app.home_art_cache,
+                        &mut app.home_strip_thumb_prepared,
+                        albums_inner,
+                        app.cell_px,
+                        albums_inner.x,
+                        albums_inner.y,
+                        app.in_tmux,
+                        crate::theme::color_to_rgba(app.theme.surface),
+                    );
+                }
                 app.home_art_needs_redraw = false;
                 if app.in_tmux {
                     app.home_art_last_tmux_render = Some(std::time::Instant::now());
@@ -532,6 +600,7 @@ async fn run_loop(
                                     key.modifiers,
                                     app.active_tab,
                                     &app.keybinds,
+                                    &mut app.pending_gg,
                                 );
                                 app.dispatch(action);
                             } else if is_quit_in_normal {
@@ -543,6 +612,7 @@ async fn run_loop(
                                     key.modifiers,
                                     &app.playlist_overlay.focus,
                                     &app.playlist_overlay.input_mode,
+                                    &app.keybinds,
                                 );
                                 app.dispatch(action);
                             }
@@ -551,8 +621,24 @@ async fn run_loop(
                                 map_help_key(key.code, key.modifiers, &app.keybinds)
                             } else if app.search_mode.active {
                                 map_search_key(key.code)
+                            } else if app.pending_global_confirm == Some(GlobalConfirm::LibraryIndexRefresh) {
+                                match key.code {
+                                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                        Action::ConfirmLibraryIndexRefresh
+                                    }
+                                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                        Action::CancelGlobalConfirm
+                                    }
+                                    _ => Action::None,
+                                }
                             } else {
-                                map_key(key.code, key.modifiers, app.active_tab, &app.keybinds)
+                                map_key(
+                                    key.code,
+                                    key.modifiers,
+                                    app.active_tab,
+                                    &app.keybinds,
+                                    &mut app.pending_gg,
+                                )
                             };
                             match action {
                                 Action::LibraryFzfPicker => {
@@ -582,35 +668,50 @@ async fn run_loop(
                     // stored state so the art is re-encoded at the new size.
                     // last_rendered_art rect will no longer match the new
                     // art_rect, so the full render path is taken on next frame.
-                    if app.kitty_supported && art_displayed {
+                    if app.kitty_apc_overlay_active() && art_displayed {
                         let _ = ui::kitty_art::clear_image(app.in_tmux);
                         art_displayed = false;
                         last_rendered_art = None;
                     }
-                    // Clear art strip thumbnails on resize so they re-render at the new size.
-                    if app.kitty_supported && app.active_tab == app::Tab::Home {
-                        let _ = ui::kitty_art::clear_art_strip(app.in_tmux);
+                    // Now Playing ratatui art — must rebuild for new layout.
+                    if app.ratatui_art_ready() && !app.ratatui_uses_kitty_apc() {
+                        app.clear_np_ratatui_art_state();
                     }
+                    // Home strip: debounced — avoids re-encoding sixel/Kitt strip on every resize tick.
+                    app.schedule_home_strip_resize_invalidate();
                 }
                 // tmux focus events (requires `focus-events on` in tmux.conf).
-                // FocusLost  → user switched to another tmux window/pane; clear
-                //              Kitty images so they don't bleed into that pane.
-                // FocusGained → we're visible again; force a full redraw.
+                // Crossterm also reports WM focus (another app focused) when
+                // `EnableFocusChange` is on — do not treat that like a tmux pane
+                // switch: the alternate-screen buffer is unchanged, so clearing
+                // ratatui-image state would re-encode Sixel on every refocus.
+                //
+                // FocusLost  → tmux only: clear Kitty overlays / ratatui state so
+                //              graphics don't bleed into another pane.
+                // FocusGained → Kitty APC: always force re-transmit (terminal may
+                //              have evicted the stored image). Ratatui: same as
+                //              FocusLost — only under tmux.
                 //
                 Event::FocusLost => {
-                    if app.kitty_supported && app.in_tmux {
+                    if app.kitty_apc_overlay_active() && app.in_tmux {
                         let _ = ui::kitty_art::clear_image(app.in_tmux);
                         let _ = ui::kitty_art::clear_art_strip(app.in_tmux);
                         art_displayed = false;
                     }
+                    if app.ratatui_art_ready() && !app.ratatui_uses_kitty_apc() && app.in_tmux {
+                        app.clear_ratatui_art_state();
+                    }
                 }
                 Event::FocusGained => {
-                    if app.kitty_supported {
+                    if app.kitty_apc_overlay_active() {
                         // Force a full art re-transmit on the next frame — same
                         // mechanism as tab return (last_rendered_art = None makes
                         // stored_matches false, taking the re-encode path).
                         art_displayed = false;
                         last_rendered_art = None;
+                    }
+                    if app.ratatui_art_ready() && !app.ratatui_uses_kitty_apc() && app.in_tmux {
+                        app.clear_ratatui_art_state();
                     }
                 }
                 _ => {}
@@ -640,7 +741,7 @@ async fn run_loop(
                 (Some((cid, _)), Some(bad)) if bad == cid => true,
                 _ => false,
             };
-            if app.kitty_supported
+            if app.kitty_apc_overlay_active()
                 && !art_displayed
                 && app.art_cache.is_some()
                 && app.active_tab == app::Tab::NowPlaying
@@ -710,7 +811,7 @@ fn handle_home_click(x: u16, y: u16, app: &mut App, center: ratatui::layout::Rec
 }
 
 fn home_click_panel(x: u16, y: u16, area: Rect, panel: HomePanel, app: &mut App) {
-    use crate::ui::kitty_art::art_strip_thumbnail_size;
+    use crate::ui::kitty_art::{art_strip_layout, art_strip_thumb_hit, KITTY_STRIP_MAX_SLOTS};
 
     match panel {
         HomePanel::RecentAlbums => {
@@ -726,17 +827,26 @@ fn home_click_panel(x: u16, y: u16, area: Rect, panel: HomePanel, app: &mut App)
             app.home.active_section = app::HomeSection::RecentAlbums;
             app.home.selected_index = 0;
 
-            let thumb_area_h = inner.height.saturating_sub(2).max(1);
-            let (thumb_cols, _) = art_strip_thumbnail_size(app.cell_px, thumb_area_h);
-            let gap = 1u16;
+            let layout = art_strip_layout(inner.width, inner.height);
             let rel_x = x.saturating_sub(inner.x);
-            let slot = (rel_x / (thumb_cols + gap)) as usize;
+            let rel_y = y.saturating_sub(inner.y);
+            let Some((row_in_grid, col_in_grid)) = art_strip_thumb_hit(&layout, rel_x, rel_y) else {
+                return;
+            };
+            let slot = (row_in_grid as usize) * layout.per_row + (col_in_grid as usize);
+            let max_slots = layout.total_visible.min(KITTY_STRIP_MAX_SLOTS);
+            if slot >= max_slots {
+                return;
+            }
             let album_index = app.home.album_scroll_offset + slot;
             if album_index < app.home.recent_albums.len() {
                 if app.home.album_selected_index == album_index {
-                    if app.kitty_supported {
+                    if app.kitty_apc_overlay_active() {
                         let _ = crate::ui::kitty_art::clear_image(app.in_tmux);
                         let _ = crate::ui::kitty_art::clear_art_strip(app.in_tmux);
+                    }
+                    if app.ratatui_art_ready() && !app.ratatui_uses_kitty_apc() {
+                        app.clear_ratatui_art_state();
                     }
                     app.active_tab = app::Tab::Browser;
                     app.search_filter = None;
@@ -795,6 +905,7 @@ fn map_playlist_key(
     modifiers: KeyModifiers,
     focus: &PlaylistFocus,
     input_mode: &PlaylistInputMode,
+    kb: &Keybinds,
 ) -> Action {
     match input_mode {
         // ── Text-input modes: feed characters into the buffer ──────────────
@@ -815,11 +926,8 @@ fn map_playlist_key(
         PlaylistInputMode::Normal => {
             let shift = modifiers.intersects(KeyModifiers::SHIFT);
             match code {
-                KeyCode::Esc   => Action::TogglePlaylistOverlay,
-                // Shift+P toggles the overlay closed (mirrors the map_key open binding).
-                KeyCode::Char('P') | KeyCode::Char('p') if code == KeyCode::Char('P') || shift => {
-                    Action::TogglePlaylistOverlay
-                }
+                KeyCode::Esc => Action::TogglePlaylistOverlay,
+                _ if kb.playlist_overlay.matches(code, modifiers) => Action::TogglePlaylistOverlay,
                 KeyCode::Char('k') | KeyCode::Up   => Action::PlaylistScrollUp,
                 KeyCode::Char('j') | KeyCode::Down => Action::PlaylistScrollDown,
                 KeyCode::Char('h') => Action::PlaylistFocusList,
@@ -864,67 +972,101 @@ fn map_picker_key(code: KeyCode, _modifiers: KeyModifiers) -> Action {
     }
 }
 
-fn map_key(code: KeyCode, modifiers: KeyModifiers, active_tab: Tab, kb: &Keybinds) -> Action {
+fn map_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    active_tab: Tab,
+    kb: &Keybinds,
+    pending_gg: &mut bool,
+) -> Action {
+    // Second `g` after a lone `g`: vim-style `gg` → top.
+    if *pending_gg {
+        *pending_gg = false;
+        if code == KeyCode::Char('g') && modifiers.is_empty() {
+            return Action::Navigate(Direction::Top);
+        }
+    }
+
     // ── Browser-tab-specific keys ─────────────────────────────────────────────
     if active_tab == Tab::Browser {
-        // Shift+P — open/close the playlist overlay
-        let shift = modifiers.intersects(KeyModifiers::SHIFT);
-        if code == KeyCode::Char('P') || (code == KeyCode::Char('p') && shift) {
+        if kb.playlist_overlay.matches(code, modifiers) {
             return Action::TogglePlaylistOverlay;
         }
-        // > — open playlist picker to add focused track to a playlist
-        if code == KeyCode::Char('>') {
+        if kb.browser_add_to_playlist.matches(code, modifiers) {
             return Action::BrowserAddToPlaylist;
         }
     }
 
     // ── Home-tab-specific keys ────────────────────────────────────────────────
     if active_tab == Tab::Home {
-        // J / Shift+j: move to next section.
-        // Handle both KeyCode::Char('J') (most terminals) and
-        // KeyCode::Char('j')+SHIFT (Ghostty / kitty keyboard protocol).
-        let shift = modifiers.intersects(KeyModifiers::SHIFT);
-        if code == KeyCode::Char('J') || (code == KeyCode::Char('j') && shift) {
+        if kb.home_section_next.matches(code, modifiers) {
             return Action::HomeSectionNext;
         }
-        // K / Shift+k: move to previous section.
-        if code == KeyCode::Char('K') || (code == KeyCode::Char('k') && shift) {
+        if kb.home_section_prev.matches(code, modifiers) {
             return Action::HomeSectionPrev;
         }
-        // r: re-roll rediscover / refresh data
-        if code == KeyCode::Char('r') && modifiers.is_empty() { return Action::HomeRefresh; }
-        // h/l: navigate album strip left/right (only active when RecentAlbums section is focused)
-        if code == KeyCode::Char('h') && modifiers.is_empty() { return Action::HomeAlbumLeft; }
-        if code == KeyCode::Char('l') && modifiers.is_empty() { return Action::HomeAlbumRight; }
-        // a: append selected album to queue
-        if code == KeyCode::Char('a') && modifiers.is_empty() { return Action::HomeAlbumAddToQueue; }
+        if kb.home_refresh.matches(code, modifiers) {
+            return Action::HomeRefresh;
+        }
+        if kb.column_left.matches(code, modifiers) {
+            return Action::HomeAlbumLeft;
+        }
+        if kb.column_right.matches(code, modifiers) {
+            return Action::HomeAlbumRight;
+        }
+        if kb.add_track.matches(code, modifiers) {
+            return Action::HomeAlbumAddToQueue;
+        }
     }
 
     // ── Always-on / non-configurable ─────────────────────────────────────────
-    // g / G: jump to top/bottom — not exposed in config
-    if code == KeyCode::Char('g') && modifiers.is_empty() { return Action::Navigate(Direction::Top);    }
-    if code == KeyCode::Char('G') && modifiers.is_empty() { return Action::Navigate(Direction::Bottom); }
+    // G: jump to bottom — not exposed in config. Top is `gg` (handled via pending_gg).
+    // Terminals usually send Shift+G as `Char('G')` with SHIFT set, not bare `G`.
+    if code == KeyCode::Char('G')
+        && !modifiers.intersects(
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::HYPER,
+        )
+    {
+        return Action::Navigate(Direction::Bottom);
+    }
     // Enter / Esc — not configurable
     if code == KeyCode::Enter { return Action::Select; }
     if code == KeyCode::Esc   { return Action::Back;   }
-    // Space is always an alias for play_pause
-    if code == KeyCode::Char(' ') { return Action::PlayPause; }
+    // Space alone is an alias for play_pause.
+    if code == KeyCode::Char(' ') && modifiers.is_empty() {
+        return Action::PlayPause;
+    }
     // '=' is always a secondary alias for volume_up (easy to hit with +)
     if code == KeyCode::Char('=') { return Action::VolumeUp; }
-    // 'i' toggles the keybind help popup
-    if code == KeyCode::Char('i') && modifiers.is_empty() { return Action::ToggleHelp; }
-    // 't' toggles dynamic accent colour
-    if code == KeyCode::Char('t') && modifiers.is_empty() { return Action::ToggleDynamicTheme; }
-    // 'L' toggles lyrics overlay (NowPlaying tab only)
-    if code == KeyCode::Char('L') { return Action::ToggleLyrics; }
-    // 'V' toggles spectrum visualizer (NowPlaying tab only)
-    let shift = modifiers.intersects(KeyModifiers::SHIFT);
-    if code == KeyCode::Char('V') || (code == KeyCode::Char('v') && shift) {
+    if kb.toggle_help.matches(code, modifiers) {
+        return Action::ToggleHelp;
+    }
+    if kb.toggle_dynamic_theme.matches(code, modifiers) {
+        return Action::ToggleDynamicTheme;
+    }
+    if kb.toggle_lyrics.matches(code, modifiers) {
+        return Action::ToggleLyrics;
+    }
+    if kb.toggle_visualizer.matches(code, modifiers)
+        || code == KeyCode::Char('V')
+        || (code == KeyCode::Char('v') && modifiers.intersects(KeyModifiers::SHIFT))
+    {
         return Action::ToggleVisualizer;
     }
     // Up/Down arrows are always secondary scroll aliases
     if code == KeyCode::Up   { return Action::Navigate(Direction::Up);   }
     if code == KeyCode::Down { return Action::Navigate(Direction::Down); }
+    // PageUp/PageDown and vim-style Ctrl+u / Ctrl+d: lists on these tabs.
+    if matches!(active_tab, Tab::Browser | Tab::Home | Tab::NowPlaying) {
+        let ctrl = modifiers.intersects(KeyModifiers::CONTROL)
+            && !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
+        if code == KeyCode::PageUp || (ctrl && matches!(code, KeyCode::Char('u') | KeyCode::Char('U'))) {
+            return Action::Navigate(Direction::PageUp);
+        }
+        if code == KeyCode::PageDown || (ctrl && matches!(code, KeyCode::Char('d') | KeyCode::Char('D'))) {
+            return Action::Navigate(Direction::PageDown);
+        }
+    }
 
     // ── Configurable keybinds ─────────────────────────────────────────────────
     if kb.quit.matches(code, modifiers)              { return Action::Quit;             }
@@ -960,7 +1102,22 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers, active_tab: Tab, kb: &Keybind
     if kb.next_track.matches(code, modifiers)   { return Action::NextTrack;    }
     if kb.prev_track.matches(code, modifiers)   { return Action::PrevTrack;    }
 
-    // add_all must be checked before add_track (it's typically a superset key).
+    // add_all variants must be checked before add_track (superset keys).
+    if let Some(spec) = &kb.add_all_replace_artist {
+        if spec.matches(code, modifiers) {
+            return Action::AddAllToQueueReplaceArtist;
+        }
+    }
+    if let Some(spec) = &kb.add_all_replace_album {
+        if spec.matches(code, modifiers) {
+            return Action::AddAllToQueueReplaceAlbum;
+        }
+    }
+    if let Some(spec) = &kb.add_all_prepend {
+        if spec.matches(code, modifiers) {
+            return Action::AddAllToQueuePrepend;
+        }
+    }
     if kb.add_all.matches(code, modifiers)      { return Action::AddAllToQueue; }
     if kb.add_track.matches(code, modifiers)    { return Action::AddToQueue;    }
 
@@ -982,6 +1139,12 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers, active_tab: Tab, kb: &Keybind
         }
     }
 
+    // Lone `g`: wait for second `g` (`gg`) to go to top (vim-style).
+    if code == KeyCode::Char('g') && modifiers.is_empty() {
+        *pending_gg = true;
+        return Action::None;
+    }
+
     Action::None
 }
 
@@ -999,9 +1162,21 @@ fn map_search_key(code: KeyCode) -> Action {
 /// Only `i`, `Esc`, and the configured quit key close the popup — everything
 /// else is suppressed so no accidental navigation occurs.
 fn map_help_key(code: KeyCode, modifiers: KeyModifiers, kb: &Keybinds) -> Action {
-    if code == KeyCode::Char('i') && modifiers.is_empty() { return Action::ToggleHelp; }
-    if code == KeyCode::Esc                               { return Action::ToggleHelp; }
-    if kb.quit.matches(code, modifiers)                   { return Action::ToggleHelp; }
+    if kb.toggle_help.matches(code, modifiers) {
+        return Action::ToggleHelp;
+    }
+    if code == KeyCode::Esc {
+        return Action::ToggleHelp;
+    }
+    if kb.quit.matches(code, modifiers) {
+        return Action::ToggleHelp;
+    }
+    if code == KeyCode::Char('k') || code == KeyCode::Up {
+        return Action::HelpScrollUp;
+    }
+    if code == KeyCode::Char('j') || code == KeyCode::Down {
+        return Action::HelpScrollDown;
+    }
     Action::None
 }
 
@@ -1022,7 +1197,7 @@ fn map_help_key(code: KeyCode, modifiers: KeyModifiers, kb: &Keybinds) -> Action
 // inside render_home_tab().  That function does, per visible thumbnail:
 //   image::load_from_memory → resize_exact(Lanczos3) → zlib compress → base64 encode
 //   → Kitty protocol write to stdout
-// For 16 albums this is multiple seconds of CPU-bound work every ~50 ms poll tick.
+// For a full strip this is multiple seconds of CPU-bound work every ~50 ms poll tick.
 //
 // Fixes applied:
 //   1. Use build_layout() for all tabs here so geometry matches the renderer.

@@ -307,8 +307,23 @@ impl SubsonicClient {
     /// Returns the raw image bytes (JPEG, PNG, etc.) as returned by Navidrome.
     /// The `id` is the `cover_art` field on a `Song` or `Album`.
     pub async fn get_cover_art(&self, id: &str) -> Result<Vec<u8>> {
+        self.get_cover_art_impl(id, None).await
+    }
+
+    /// Like [`get_cover_art`](Self::get_cover_art) but passes Subsonic `size` (max edge in pixels).
+    ///
+    /// Navidrome and most servers return a smaller JPEG/PNG, which is faster to download and decode
+    /// than full-resolution artwork.
+    pub async fn get_cover_art_sized(&self, id: &str, size: u32) -> Result<Vec<u8>> {
+        self.get_cover_art_impl(id, Some(size.max(32).min(2048))).await
+    }
+
+    async fn get_cover_art_impl(&self, id: &str, size: Option<u32>) -> Result<Vec<u8>> {
         let mut params = self.auth_params();
         params.push(("id", id.to_string()));
+        if let Some(s) = size {
+            params.push(("size", s.to_string()));
+        }
         let response = self
             .http
             .get(self.endpoint_url("getCoverArt"))

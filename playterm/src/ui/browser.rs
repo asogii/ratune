@@ -8,7 +8,7 @@ use crate::app::{App, BrowserColumn};
 use crate::config::BrowseMode;
 use super::{artists, albums, playlist_overlay, tracks};
 
-pub fn render(app: &App, frame: &mut Frame, area: Rect) {
+pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
     match app.config.browse_mode {
         BrowseMode::Artists => {}
         BrowseMode::Genre => {

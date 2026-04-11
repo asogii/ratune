@@ -4,9 +4,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState};
 
 use crate::app::App;
-use crate::state::LoadingState;
+use crate::state::{LibraryState, LoadingState};
 
-pub fn render(app: &App, frame: &mut Frame, area: Rect, is_active: bool) {
+pub fn render(app: &mut App, frame: &mut Frame, area: Rect, is_active: bool) {
     let t = &app.theme;
     let border_color = if is_active { t.border_active } else { t.border };
     let title_color  = if is_active { app.accent() }    else { t.dimmed };
@@ -88,8 +88,27 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect, is_active: bool) {
                 .highlight_symbol("▶ ")
                 .style(Style::default().bg(t.surface));
 
+            let vh = area.height.saturating_sub(2) as usize;
+            let vh = vh.max(1);
+            app.browser_list_viewport_rows = vh;
+
             let mut state = ListState::default();
-            state.select(sel);
+            if !visible.is_empty() {
+                if let Some(sel_ix) = sel {
+                    LibraryState::clamp_vertical_scroll(
+                        &mut app.library.tracks_scroll,
+                        sel_ix,
+                        visible.len(),
+                        vh,
+                    );
+                    state = ListState::default().with_offset(app.library.tracks_scroll);
+                    state.select(Some(sel_ix));
+                } else {
+                    let max_first = visible.len().saturating_sub(vh);
+                    app.library.tracks_scroll = app.library.tracks_scroll.min(max_first);
+                    state = ListState::default().with_offset(app.library.tracks_scroll);
+                }
+            }
             frame.render_stateful_widget(list, area, &mut state);
         }
     }

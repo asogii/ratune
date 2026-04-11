@@ -2,6 +2,7 @@
 ///
 /// All fields default to the current hardcoded palette so the appearance is
 /// identical when no `[theme]` section is present in config.toml.
+use image::Rgba;
 use ratatui::style::Color;
 
 use crate::config::ThemeSection;
@@ -56,6 +57,17 @@ impl Theme {
 }
 
 /// Parse a 6-digit hex colour string (with or without leading `#`).
+/// Solid RGBA for `ratatui-image` padding (Sixel has no transparency — must match panel bg).
+pub fn color_to_rgba(c: Color) -> Rgba<u8> {
+    match c {
+        Color::Rgb(r, g, b) => Rgba([r, g, b, 255]),
+        // 16/256-colour terminals: approximate with dark grey (same default as `surface`).
+        Color::Indexed(_) | Color::Reset => Rgba([22, 22, 22, 255]),
+        // Named ANSI colours — pad with a neutral dark grey (theme is usually Rgb).
+        _ => Rgba([22, 22, 22, 255]),
+    }
+}
+
 fn parse_hex(s: &str) -> Option<Color> {
     let s = s.trim().trim_start_matches('#');
     if s.len() != 6 {

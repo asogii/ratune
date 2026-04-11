@@ -29,20 +29,24 @@ max_bit_rate = 0
 mpris = true
 
 [keybinds]
+# Use "Shift+n" (or capital N — same meaning) for shift+letter keys so all terminals match.
 scroll_up = "k"
 scroll_down = "j"
 column_left = "h"
 column_right = "l"
 play_pause = "p"
 next_track = "n"
-prev_track = "N"
+prev_track = "Shift+n"
 seek_forward = "Right"
 seek_backward = "Left"
 add_track = "a"
 add_all = "Shift+a"
+add_all_replace_album = "Ctrl+r"
+add_all_replace_artist = "Ctrl+Shift+r"
+add_all_prepend = "Ctrl+Shift+p"
 shuffle = "x"
 unshuffle = "z"
-clear_queue = "D"
+clear_queue = "Shift+d"
 search = "/"
 volume_up = "+"
 volume_down = "-"
@@ -53,7 +57,16 @@ go_to_browser = "2"
 go_to_nowplaying = "3"
 quit = "q"
 library_fzf = "Ctrl+f"
-library_refresh = "Ctrl+r"
+library_refresh = "Ctrl+g"
+toggle_help = "i"
+toggle_dynamic_theme = "t"
+toggle_lyrics = "Shift+l"
+toggle_visualizer = "Shift+v"
+playlist_overlay = "Shift+p"
+browser_add_to_playlist = ">"
+home_section_next = "Shift+j"
+home_section_prev = "Shift+k"
+home_refresh = "r"
 
 [theme]
 accent = "#ff8c00"
@@ -89,6 +102,7 @@ lines = [
 
 [ui.hometab.recent_albums]
 show_art = true
+cover_fetch_max_px = 320
 
 [ui.hometab.layout]
 top_height_percent = 50

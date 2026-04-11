@@ -34,9 +34,31 @@ pub struct LibraryState {
     /// Songs keyed by album ID.
     pub tracks: HashMap<String, LoadingState<Vec<Song>>>,
     pub selected_track: Option<usize>,
+
+    /// First visible row index in the artist column (filtered list coordinates).
+    pub artists_scroll: usize,
+    pub albums_scroll: usize,
+    pub tracks_scroll: usize,
 }
 
 impl LibraryState {
+    /// Keep row `sel` visible in a list of `len` rows with `visible` rows on screen.
+    pub fn clamp_vertical_scroll(scroll: &mut usize, sel: usize, len: usize, visible: usize) {
+        if len == 0 || visible == 0 {
+            return;
+        }
+        let sel = sel.min(len - 1);
+        let max_first = if len <= visible { 0 } else { len - visible };
+        if *scroll > max_first {
+            *scroll = max_first;
+        }
+        if sel < *scroll {
+            *scroll = sel;
+        } else if sel >= *scroll + visible {
+            *scroll = sel + 1 - visible;
+        }
+    }
+
     /// The artist currently highlighted, if the artist list is loaded.
     pub fn current_artist(&self) -> Option<&Artist> {
         if let LoadingState::Loaded(artists) = &self.artists {
@@ -102,7 +124,6 @@ impl QueueState {
     pub fn next(&mut self) -> bool {
         if self.cursor + 1 < self.songs.len() {
             self.cursor += 1;
-            self.scroll = self.cursor;
             true
         } else {
             false
@@ -118,12 +139,67 @@ impl QueueState {
     pub fn prev(&mut self) -> bool {
         if self.cursor > 0 {
             self.cursor -= 1;
-            self.scroll = self.cursor;
             true
         } else {
             false
         }
     }
+
+    /// Keep the playback cursor row visible in a list with `visible` rows (excluding borders).
+    /// Does not force the cursor to the top of the viewport; scroll only moves when needed.
+    pub fn scroll_clamp_cursor_visible(&mut self, visible: usize) {
+        let len = self.songs.len();
+        if len == 0 || visible == 0 {
+            return;
+        }
+        let c = self.cursor.min(len - 1);
+        let max_first = if len <= visible { 0 } else { len - visible };
+        if self.scroll > max_first {
+            self.scroll = max_first;
+        }
+        if c < self.scroll {
+            self.scroll = c;
+        } else if c >= self.scroll + visible {
+            self.scroll = c + 1 - visible;
+        }
+    }
+
+    /// Insert `incoming` at the front of the queue in order; advances `cursor` so the
+    /// currently playing track index still refers to the same song.
+    pub fn prepend_songs(&mut self, incoming: Vec<Song>) {
+        if incoming.is_empty() {
+            return;
+        }
+        if self.songs.is_empty() {
+            for s in incoming {
+                self.push(s);
+            }
+            return;
+        }
+        let n = incoming.len();
+        match &mut self.pre_shuffle_order {
+            Some(orig) => {
+                for s in incoming.iter().rev() {
+                    orig.insert(0, s.clone());
+                }
+            }
+            None => {
+                self.pre_shuffle_order = Some(
+                    incoming.iter().chain(self.songs.iter()).cloned().collect(),
+                );
+            }
+        }
+        for s in incoming.into_iter().rev() {
+            self.songs.insert(0, s);
+        }
+        self.cursor += n;
+    }
+}
+
+/// Pending confirmation for destructive / expensive actions (outside playlist overlay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalConfirm {
+    LibraryIndexRefresh,
 }
 
 // ── PlaylistOverlay ───────────────────────────────────────────────────────────

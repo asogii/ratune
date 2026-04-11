@@ -2,8 +2,10 @@
 pub enum Direction {
     Up,
     Down,
-    Top,    // g
+    Top,    // gg (vim-style)
     Bottom, // G
+    PageUp,
+    PageDown,
 }
 
 use std::time::Duration;
@@ -27,6 +29,12 @@ pub enum Action {
     FocusRight,
     AddToQueue,
     AddAllToQueue,
+    /// Browser: replace queue with the **current album** (selected album + loaded tracks) and play.
+    AddAllToQueueReplaceAlbum,
+    /// Browser: replace queue with **all tracks for the current artist** (API fetch) and play.
+    AddAllToQueueReplaceArtist,
+    /// Browser: add all tracks — insert at the front of the queue.
+    AddAllToQueuePrepend,
     PlayPause,
     NextTrack,
     PrevTrack,
@@ -52,6 +60,10 @@ pub enum Action {
     ToggleVisualizer,
     /// Toggle the keybind reference popup.
     ToggleHelp,
+    /// Scroll the help popup up one line.
+    HelpScrollUp,
+    /// Scroll the help popup down one line.
+    HelpScrollDown,
     /// Move to the next section on the Home tab (RecentAlbums → RecentTracks → TopArtists → Rediscover).
     HomeSectionNext,
     /// Move to the previous section on the Home tab.
@@ -117,6 +129,10 @@ pub enum Action {
     LibraryFzfPicker,
     /// Force a full refresh of the metadata index from Subsonic.
     LibraryIndexRefresh,
+    /// Confirm a pending full library index refresh.
+    ConfirmLibraryIndexRefresh,
+    /// Dismiss a global confirmation prompt (e.g. library refresh).
+    CancelGlobalConfirm,
     Quit,
     None,
 }

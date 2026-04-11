@@ -6,9 +6,11 @@
 //! Images are transmitted with `a=T` (transmit-and-display), `f=32` (RGBA8),
 //! `o=z` (zlib-compressed), and positioned via a preceding cursor-move escape.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 
 use anyhow::Result;
+use image::Rgba;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Block, BorderType, Borders};
 
@@ -199,10 +201,22 @@ pub fn album_art_placeholder_inner(outer: Rect) -> Rect {
 /// [`album_art_placeholder_inner`] applied to the same outer `Rect` as the ratatui placeholder.
 /// Coordinates are ratatui’s 0-based buffer positions; CSI cursor uses 1-based rows/cols.
 ///
+/// `cell_px` — terminal cell size in pixels (`CSI 16 t` or ratatui-image picker). `None` → 10×20.
+///
+/// `pad` letterboxes the cover so bitmap aspect matches the **physical** `c×r` cell grid; otherwise
+/// Kitty stretches a wrong-aspect bitmap to fill the placement.
+///
 /// When `in_tmux` is `false`: direct APC placement (`a=T` with `c=`/`r=`).
 ///
 /// When `in_tmux` is `true`: Unicode placeholder method (`a=t` + `a=p,U=1` + row diacritics).
-pub fn render_image(bytes: &[u8], placement: Rect, in_tmux: bool, tmux_status_offset: u16) -> Result<()> {
+pub fn render_image(
+    bytes: &[u8],
+    placement: Rect,
+    in_tmux: bool,
+    tmux_status_offset: u16,
+    cell_px: Option<(u16, u16)>,
+    pad: Rgba<u8>,
+) -> Result<()> {
     use base64::Engine;
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
@@ -220,15 +234,17 @@ pub fn render_image(bytes: &[u8], placement: Rect, in_tmux: bool, tmux_status_of
         inner_h
     };
 
-    // Decode image from raw bytes.
-    let img = image::load_from_memory(bytes)?;
+    let place_rows = if in_tmux { tmux_rows } else { inner_h };
+    let fw = cell_px.map(|(w, _)| w as u32).filter(|&w| w > 0).unwrap_or(10);
+    let fh = cell_px.map(|(_, h)| h as u32).filter(|&h| h > 0).unwrap_or(20);
 
-    // Resize to fit the inner area.  We estimate 10 px per column, 20 px per row
-    // (a reasonable approximation for most terminals).  Cap at 1024 to avoid
-    // transferring enormous payloads on very large terminals.
-    let px_w = (inner_w as u32 * 10).min(1024);
-    let px_h = (if in_tmux { tmux_rows } else { inner_h } as u32 * 20).min(1024);
-    let img = img.resize(px_w, px_h, image::imageops::FilterType::Lanczos3);
+    let phys_w = inner_w as u32 * fw;
+    let phys_h = place_rows as u32 * fh;
+    let (tw, th) =
+        crate::ui::art_prepare::uniform_scale_dimensions_to_max_edge(phys_w, phys_h, crate::ui::art_prepare::MAX_ART_EDGE_PX);
+
+    let img = image::load_from_memory(bytes)?;
+    let img = crate::ui::art_prepare::prepare_art_image_for_exact_pixels_contain_centered(img, tw, th, pad);
     let img_rgba = img.to_rgba8();
     let (w, h) = img_rgba.dimensions();
     let raw = img_rgba.into_raw();
@@ -305,7 +321,7 @@ pub fn render_image(bytes: &[u8], placement: Rect, in_tmux: bool, tmux_status_of
                 write!(
                     out,
                     "{}",
-                    apc(&format!("a=T,f=32,i=1,s={w},v={h},c={inner_w},r={inner_h},o=z,m={m},q=2;{chunk_str}"), false)
+                    apc(&format!("a=T,f=32,i=1,s={w},v={h},c={inner_w},r={place_rows},o=z,m={m},q=2;{chunk_str}"), false)
                 )?;
             } else {
                 write!(out, "{}", apc(&format!("m={m};{chunk_str}"), false))?;
@@ -416,65 +432,350 @@ fn parse_cell_size_response(response: &str) -> Option<(u16, u16)> {
 
 // ── Art strip sizing helpers ──────────────────────────────────────────────────
 
-/// Compute thumbnail size for the home art strip.
-///
-/// Returns `(thumb_cols, thumb_rows)` in terminal cell units.
-/// Both dimensions equal `strip_rows` (square in cell count) — the
-/// `cell_px` parameter is ignored for sizing because CSI 16 t returns
-/// unreliable values on Ghostty macOS.  A fixed 32 px/cell assumption
-/// is used instead when computing pixel dimensions in `render_art_strip`.
-pub fn art_strip_thumbnail_size(_cell_px: Option<(u16, u16)>, strip_rows: u16) -> (u16, u16) {
-    // Cells are ~2:1 tall-to-wide, so double the column count to produce square thumbnails.
-    (strip_rows * 2, strip_rows)
+/// Horizontal gap between thumbnails (character cells).
+pub const STRIP_GAP_COLS: u16 = 2;
+/// Vertical gap between thumb rows (and between first thumb row and its label block).
+pub const STRIP_GAP_ROWS: u16 = 2;
+
+/// Smallest / largest thumb slot in character cells (search range for [`art_strip_layout`]).
+const MIN_THUMB_COLS: u16 = 8;
+const MAX_THUMB_COLS: u16 = 36;
+const MIN_THUMB_ROWS: u16 = 3;
+const MAX_THUMB_ROWS: u16 = 16;
+
+/// Album + artist lines placed **below each row of thumbnails** (not one line for the whole grid).
+const STRIP_LABEL_LINES_PER_THUMB_ROW: u16 = 2;
+
+/// Kitty image IDs for strip placements (`100 + slot`, slot < `KITTY_STRIP_MAX_SLOTS`).
+pub const KITTY_STRIP_ID_BASE: u32 = 100;
+pub const KITTY_STRIP_MAX_SLOTS: usize = 32;
+
+/// Layout for the Recently Played block (`albums_inner`: full inner rect of the bordered panel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtStripLayout {
+    pub thumb_cols: u16,
+    pub thumb_rows: u16,
+    /// 1 or 2 rows of thumbnails.
+    pub grid_rows: u16,
+    pub per_row: usize,
+    pub total_visible: usize,
+    /// Horizontal inset so the thumb grid is centered in `albums_inner`.
+    pub pad_x: u16,
+    /// Vertical inset so thumbs + labels are centered in `albums_inner`.
+    pub pad_y: u16,
 }
 
-/// How many thumbnails fit horizontally in `terminal_cols` columns.
+impl ArtStripLayout {
+    /// Width in cells occupied by one full row of thumbnails (including gaps between columns).
+    pub fn used_width_cells(&self) -> u16 {
+        let pr = self.per_row as u16;
+        pr.saturating_mul(self.thumb_cols)
+            .saturating_add(pr.saturating_sub(1).saturating_mul(STRIP_GAP_COLS))
+    }
+
+    /// Y offset from `albums_inner.y` to the top of thumb row `row_in_grid` (0 or 1).
+    pub fn thumb_row_top_dy(&self, row_in_grid: u16) -> u16 {
+        match row_in_grid {
+            0 => self.pad_y,
+            1 => self
+                .pad_y
+                .saturating_add(self.thumb_rows)
+                .saturating_add(STRIP_LABEL_LINES_PER_THUMB_ROW)
+                .saturating_add(STRIP_GAP_ROWS),
+            _ => self.pad_y,
+        }
+    }
+
+    /// Top dy of the album-name line under thumb row `row_in_grid`.
+    pub fn album_label_top_dy(&self, row_in_grid: u16) -> u16 {
+        self.thumb_row_top_dy(row_in_grid)
+            .saturating_add(self.thumb_rows)
+    }
+}
+
+/// Total height of thumbs + interleaved label lines (+ gap between thumb rows when `grid_rows == 2`).
+pub fn art_strip_content_height(grid_rows: u16, thumb_rows: u16) -> u16 {
+    match grid_rows {
+        2 => thumb_rows
+            .saturating_add(STRIP_LABEL_LINES_PER_THUMB_ROW)
+            .saturating_add(STRIP_GAP_ROWS)
+            .saturating_add(thumb_rows)
+            .saturating_add(STRIP_LABEL_LINES_PER_THUMB_ROW),
+        _ => thumb_rows.saturating_add(STRIP_LABEL_LINES_PER_THUMB_ROW),
+    }
+}
+
+/// When the “hero” layout fits fewer than 4 slots, fall back to smaller thumbs so at least four can
+/// show when the panel width allows (narrow terminals).
+const THUMB_MODE_MAX_COLS: u16 = 12;
+const THUMB_MODE_MAX_ROWS: u16 = 5;
+
+/// Fingerprint for cache invalidation when the strip geometry changes.
+pub fn strip_layout_key(inner: ratatui::layout::Rect, layout: &ArtStripLayout) -> u64 {
+    let mut h = inner.width as u64;
+    h = h.wrapping_mul(31).wrapping_add(inner.height as u64);
+    h = h.wrapping_mul(31).wrapping_add(layout.thumb_cols as u64);
+    h = h.wrapping_mul(31).wrapping_add(layout.thumb_rows as u64);
+    h = h.wrapping_mul(31).wrapping_add(layout.grid_rows as u64);
+    h.wrapping_mul(31).wrapping_add(layout.per_row as u64)
+}
+
+/// Smaller thumb cells so more columns fit — used when [`pick_best_strip_dimensions`] yields fewer than 4 slots.
+fn pick_compact_thumbnail_strip_dimensions(inner_w: u16, inner_h: u16) -> (u16, u16, u16) {
+    let mut best: Option<(u16, u16, u16, usize)> = None;
+
+    for grid_rows in [2u16, 1u16] {
+        for tr in (MIN_THUMB_ROWS..=THUMB_MODE_MAX_ROWS).rev() {
+            let ch = art_strip_content_height(grid_rows, tr);
+            if ch > inner_h {
+                continue;
+            }
+            for tc in (MIN_THUMB_COLS..=THUMB_MODE_MAX_COLS).rev() {
+                let stride = tc.saturating_add(STRIP_GAP_COLS);
+                if stride == 0 {
+                    continue;
+                }
+                let per_row = (inner_w / stride) as usize;
+                if per_row == 0 {
+                    continue;
+                }
+                let slots = per_row * (grid_rows as usize);
+                if slots < 4 {
+                    continue;
+                }
+                let replace = match best {
+                    None => true,
+                    Some((_, _, _, s)) => slots > s,
+                };
+                if replace {
+                    best = Some((tc, tr, grid_rows, slots));
+                }
+            }
+        }
+    }
+
+    best.map(|(tc, tr, gr, _)| (tc, tr, gr))
+        .unwrap_or((MIN_THUMB_COLS, MIN_THUMB_ROWS, 1))
+}
+
+/// Pick `(thumb_cols, thumb_rows, grid_rows)` to maximize on-screen thumb size while fitting the
+/// panel; prefer two thumb rows when height allows (strong bonus so full-screen uses both rows).
+fn pick_best_strip_dimensions(inner_w: u16, inner_h: u16) -> (u16, u16, u16) {
+    let mut best: Option<(u16, u16, u16, i64)> = None;
+
+    for grid_rows in [2u16, 1u16] {
+        for tr in (MIN_THUMB_ROWS..=MAX_THUMB_ROWS).rev() {
+            let ch = art_strip_content_height(grid_rows, tr);
+            if ch > inner_h {
+                continue;
+            }
+            for tc in (MIN_THUMB_COLS..=MAX_THUMB_COLS).rev() {
+                let stride = tc.saturating_add(STRIP_GAP_COLS);
+                if stride == 0 {
+                    continue;
+                }
+                let per_row = (inner_w / stride) as usize;
+                if per_row == 0 {
+                    continue;
+                }
+                let pr_u16 = per_row as u16;
+                let used_w = pr_u16
+                    .saturating_mul(tc)
+                    .saturating_add(pr_u16.saturating_sub(1).saturating_mul(STRIP_GAP_COLS));
+                if used_w > inner_w {
+                    continue;
+                }
+                let pad_x = inner_w.saturating_sub(used_w) / 2;
+                let slots = per_row * (grid_rows as usize);
+                // Total character cells used by all thumbnails — prefers two rows when that uses
+                // the panel better than one oversized row (fixes “full screen but tiny second row”).
+                let total_thumb_cells = (tc as i64) * (tr as i64) * (slots as i64);
+                let mut score = total_thumb_cells * 1000 - (pad_x as i64) * 120;
+                if grid_rows == 2 && inner_h >= 18 {
+                    // Mild boost so a tall window picks two rows over one very tall strip.
+                    score = score * 3 / 2;
+                }
+                let replace = match best {
+                    None => true,
+                    Some((_, _, _, s)) => score > s,
+                };
+                if replace {
+                    best = Some((tc, tr, grid_rows, score));
+                }
+            }
+        }
+    }
+
+    best.map(|(tc, tr, gr, _)| (tc, tr, gr))
+        .unwrap_or((MIN_THUMB_COLS, MIN_THUMB_ROWS, 1))
+}
+
+/// Full `albums_inner` width and height (recently played block inner rect).
+pub fn art_strip_layout(albums_inner_w: u16, albums_inner_h: u16) -> ArtStripLayout {
+    let (mut thumb_cols, mut thumb_rows, mut grid_rows) =
+        pick_best_strip_dimensions(albums_inner_w, albums_inner_h);
+    let mut per_row = visible_thumbnail_count(albums_inner_w, thumb_cols, STRIP_GAP_COLS);
+    if per_row * (grid_rows as usize) < 4 {
+        (thumb_cols, thumb_rows, grid_rows) =
+            pick_compact_thumbnail_strip_dimensions(albums_inner_w, albums_inner_h);
+        per_row = visible_thumbnail_count(albums_inner_w, thumb_cols, STRIP_GAP_COLS);
+    }
+    let total_visible = per_row * grid_rows as usize;
+    let used_w = (per_row as u16)
+        .saturating_mul(thumb_cols)
+        .saturating_add((per_row as u16).saturating_sub(1).saturating_mul(STRIP_GAP_COLS));
+    let pad_x = albums_inner_w.saturating_sub(used_w) / 2;
+    let content_h = art_strip_content_height(grid_rows, thumb_rows);
+    let pad_y = albums_inner_h.saturating_sub(content_h) / 2;
+    ArtStripLayout {
+        thumb_cols,
+        thumb_rows,
+        grid_rows,
+        per_row,
+        total_visible,
+        pad_x,
+        pad_y,
+    }
+}
+
+/// If `(rel_x, rel_y)` is inside a thumbnail cell, return `(row_in_grid, col_in_grid)`.
+/// Coordinates are relative to the top-left of `albums_inner` (0,0).
+pub fn art_strip_thumb_hit(layout: &ArtStripLayout, rel_x: u16, rel_y: u16) -> Option<(u16, u16)> {
+    let ux = layout.used_width_cells();
+    if rel_x < layout.pad_x || rel_x >= layout.pad_x.saturating_add(ux) {
+        return None;
+    }
+    let rx = rel_x - layout.pad_x;
+    let stride = layout.thumb_cols + STRIP_GAP_COLS;
+    let col = (rx / stride) as u16;
+    if rx % stride >= layout.thumb_cols || (col as usize) >= layout.per_row {
+        return None;
+    }
+
+    let row_in_grid = if layout.grid_rows == 1 {
+        let top = layout.pad_y;
+        let bot = top.saturating_add(layout.thumb_rows);
+        if rel_y >= top && rel_y < bot {
+            0
+        } else {
+            return None;
+        }
+    } else {
+        let r0_top = layout.pad_y;
+        let r0_bot = r0_top.saturating_add(layout.thumb_rows);
+        let r1_top = layout.thumb_row_top_dy(1);
+        let r1_bot = r1_top.saturating_add(layout.thumb_rows);
+        if rel_y >= r0_top && rel_y < r0_bot {
+            0
+        } else if rel_y >= r1_top && rel_y < r1_bot {
+            1
+        } else {
+            return None;
+        }
+    };
+
+    Some((row_in_grid, col))
+}
+
+/// How many thumbnails fit horizontally in `terminal_cols` columns (already the inner width).
 pub fn visible_thumbnail_count(terminal_cols: u16, thumb_cols: u16, gap_cols: u16) -> usize {
     if thumb_cols + gap_cols == 0 {
         return 1;
     }
-    let count = ((terminal_cols.saturating_sub(2)) / (thumb_cols + gap_cols)) as usize;
+    let count = (terminal_cols / (thumb_cols + gap_cols)) as usize;
     count.max(1)
+}
+
+
+/// Cached resize + zlib for one Home-strip thumbnail (Kitty image id is chosen per slot at draw time).
+#[derive(Debug, Clone)]
+pub struct StripThumbPrepared {
+    /// Bitmap width/height when this payload was built (must match current strip geometry).
+    pub target_w: u32,
+    pub target_h: u32,
+    pub img_w: u32,
+    pub img_h: u32,
+    /// Base64 of zlib-compressed RGBA — built once so tab redraws skip re-encoding.
+    pub b64: String,
+}
+
+impl StripThumbPrepared {
+    pub fn matches_size(&self, tw: u32, th: u32) -> bool {
+        self.target_w == tw && self.target_h == th
+    }
+
+    /// Decode cover bytes, contain+letterbox to `tw×th` (matches `c×r` cell aspect), zlib RGBA.
+    pub fn build(cover_bytes: &[u8], tw: u32, th: u32, pad: Rgba<u8>) -> Option<Self> {
+        use base64::Engine;
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let img = image::load_from_memory(cover_bytes).ok()?;
+        let img = crate::ui::art_prepare::prepare_art_image_for_exact_pixels_contain_centered(
+            img, tw, th, pad,
+        );
+        let img_rgba = img.to_rgba8();
+        let (w, h) = img_rgba.dimensions();
+        let raw = img_rgba.into_raw();
+        // Fast zlib: Kitty only needs valid compressed RGBA; size difference is tiny vs decode cost.
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(&raw).ok()?;
+        let zlib_body = enc.finish().ok()?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&zlib_body);
+        Some(Self {
+            target_w: tw,
+            target_h: th,
+            img_w: w,
+            img_h: h,
+            b64,
+        })
+    }
 }
 
 // ── Art strip rendering ───────────────────────────────────────────────────────
 
 /// Render the home tab art strip using Kitty protocol.
 ///
-/// Kitty image IDs 100–115 are reserved for the art strip slots.
+/// Image IDs [`KITTY_STRIP_ID_BASE`] … + slot (up to [`KITTY_STRIP_MAX_SLOTS`]).
 /// Writes escape sequences directly to stdout (same as `render_image`).
 #[allow(clippy::too_many_arguments)]
 pub fn render_art_strip(
     albums: &[crate::app::RecentAlbum],
     scroll_offset: usize,
     _selected_index: usize,
-    art_cache: &std::collections::HashMap<String, Vec<u8>>,
+    art_cache: &HashMap<String, Vec<u8>>,
+    prepared: &mut HashMap<String, StripThumbPrepared>,
     strip_area: ratatui::layout::Rect,
     cell_px: Option<(u16, u16)>,
     terminal_col_offset: u16,
     terminal_row_offset: u16,
     in_tmux: bool,
+    pad: Rgba<u8>,
 ) {
-    use base64::Engine;
-    use flate2::Compression;
-    use flate2::write::ZlibEncoder;
-
     // Pre-clear previous art strip images/placements before drawing new ones.
     if in_tmux {
         // tmux path: delete virtual placements (d=i lowercase).
         let mut out = io::stdout().lock();
-        for id in 100u32..=115 {
+        for id in KITTY_STRIP_ID_BASE..KITTY_STRIP_ID_BASE + KITTY_STRIP_MAX_SLOTS as u32 {
             let _ = write!(out, "{}", apc(&format!("a=d,d=i,i={id},q=2"), true));
         }
     }
 
-    let (thumb_cols, thumb_rows) = art_strip_thumbnail_size(cell_px, strip_area.height);
-    let visible_count = visible_thumbnail_count(strip_area.width, thumb_cols, 1);
-    // Use strip height in cells as both width and height (square grid).
-    // Fixed 32 px/cell — reliable on HiDPI Ghostty; avoids trusting CSI 16 t.
-    let thumb_px = thumb_rows as u32 * 32;
-    let px_w = thumb_px;
-    let px_h = thumb_px;
+    let layout = art_strip_layout(strip_area.width, strip_area.height);
+    let thumb_cols = layout.thumb_cols;
+    let thumb_rows = layout.thumb_rows;
+    let visible_count = layout.total_visible.min(KITTY_STRIP_MAX_SLOTS);
+    let fw = cell_px.map(|(w, _)| w as u32).filter(|&w| w > 0).unwrap_or(10);
+    let fh = cell_px.map(|(_, h)| h as u32).filter(|&h| h > 0).unwrap_or(20);
+    // Physical size of one thumb slot — bitmap aspect must match or Kitty stretches (square thumbs were wrong).
+    let phys_w = thumb_cols as u32 * fw;
+    let phys_h = thumb_rows as u32 * fh;
+    let (tw, th) = crate::ui::art_prepare::uniform_scale_dimensions_to_max_edge(
+        phys_w,
+        phys_h,
+        crate::ui::art_prepare::MAX_ART_EDGE_PX,
+    );
 
     for i in 0..visible_count {
         let album_index = scroll_offset + i;
@@ -482,38 +783,34 @@ pub fn render_art_strip(
             break;
         }
         let album_id = &albums[album_index].album_id;
-        let kitty_id: u32 = 100 + i as u32;
+        let kitty_id: u32 = KITTY_STRIP_ID_BASE + i as u32;
+
+        let row_in_grid = (i / layout.per_row) as u16;
+        let col_in_grid = (i % layout.per_row) as u16;
+        let col = terminal_col_offset
+            .saturating_add(layout.pad_x)
+            .saturating_add(col_in_grid * (thumb_cols + STRIP_GAP_COLS));
+        let base_row = terminal_row_offset.saturating_add(layout.thumb_row_top_dy(row_in_grid));
 
         if let Some(bytes) = art_cache.get(album_id) {
-            // Decode and resize.
-            let img = match image::load_from_memory(bytes) {
-                Ok(i) => i,
-                Err(_) => continue,
+            let prep = match prepared.remove(album_id) {
+                Some(p) if p.matches_size(tw, th) => p,
+                _ => match StripThumbPrepared::build(bytes, tw, th, pad) {
+                    Some(p) => p,
+                    None => continue,
+                },
             };
-            let img = img.resize_exact(px_w, px_h, image::imageops::FilterType::Lanczos3);
-            let img_rgba = img.to_rgba8();
-            let (w, h) = img_rgba.dimensions();
-            let raw = img_rgba.into_raw();
-
-            // Zlib-compress.
-            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-            if enc.write_all(&raw).is_err() { continue; }
-            let compressed = match enc.finish() { Ok(c) => c, Err(_) => continue };
-
-            // Base64-encode.
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
-
-            let col = terminal_col_offset + i as u16 * (thumb_cols + 1);
-            let row = terminal_row_offset;
+            let w = prep.img_w;
+            let h = prep.img_h;
 
             let mut out = io::stdout().lock();
 
             // Transmit image in chunks (same for both paths — a=t: store only).
             const CHUNK: usize = 4096;
-            let chunks: Vec<&[u8]> = b64.as_bytes().chunks(CHUNK).collect();
-            let n = chunks.len();
-            for (ci, chunk) in chunks.iter().enumerate() {
-                let is_last = ci == n - 1;
+            let b64_bytes = prep.b64.as_bytes();
+            let n_chunks = (b64_bytes.len() + CHUNK - 1) / CHUNK;
+            for (ci, chunk) in b64_bytes.chunks(CHUNK).enumerate() {
+                let is_last = ci + 1 == n_chunks || n_chunks == 0;
                 let m = if is_last { 0u8 } else { 1u8 };
                 let chunk_str = unsafe { std::str::from_utf8_unchecked(chunk) };
                 if ci == 0 {
@@ -540,7 +837,7 @@ pub fn render_art_strip(
                     let _ = write!(
                         out,
                         "\x1b[{};{}H{}",
-                        row + 1 + pr,
+                        base_row + 1 + pr,
                         col + 1,
                         placeholder_row(thumb_cols, kitty_id, pr as usize)
                     );
@@ -550,26 +847,27 @@ pub fn render_art_strip(
                 let _ = write!(
                     out,
                     "\x1b[{};{}H{}",
-                    row + 1,
+                    base_row + 1,
                     col + 1,
                     apc(&format!("a=p,i={kitty_id},p=1,c={thumb_cols},r={thumb_rows},q=2;"), false)
                 );
             }
             let _ = out.flush();
+            prepared.insert(album_id.clone(), prep);
         }
         // If bytes are NOT in cache, leave the cells blank — ratatui has already
         // drawn the placeholder character(s) via the text fallback path in home_tab.rs.
     }
 }
 
-/// Delete all Kitty art-strip images/placements (IDs 100–115).
+/// Delete all Kitty art-strip images/placements (IDs `KITTY_STRIP_ID_BASE` … + max slots).
 ///
 /// Non-tmux: `a=d,d=I` — deletes image data and all placements.
 /// tmux: `a=d,d=i` — deletes virtual placements; image data freed separately.
 /// Call on tab departure or terminal resize.
 pub fn clear_art_strip(in_tmux: bool) -> Result<()> {
     let mut out = io::stdout().lock();
-    for id in 100u32..=115 {
+    for id in KITTY_STRIP_ID_BASE..KITTY_STRIP_ID_BASE + KITTY_STRIP_MAX_SLOTS as u32 {
         if in_tmux {
             write!(out, "{}", apc(&format!("a=d,d=i,i={id},q=2"), true))?;
         } else {

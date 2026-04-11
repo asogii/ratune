@@ -3,6 +3,9 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui_image::picker::ProtocolType;
+use ratatui_image::thread::ThreadProtocol;
+use ratatui_image::StatefulImage;
 
 use super::now_playing;
 use super::queue;
@@ -10,7 +13,7 @@ use super::visualizer::render_visualizer;
 
 use crate::app::App;
 
-pub fn render(app: &App, frame: &mut Frame, area: Rect) {
+pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
     let boxed = app
         .config
         .now_playing_layout
@@ -161,13 +164,116 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect) {
     }
 }
 
-fn render_art_placeholder(app: &App, frame: &mut Frame, area: Rect) {
+fn sync_np_ratatui_protocol(app: &mut App, inner: Rect) {
+    if !app.ratatui_art_ready() || inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if app.ratatui_uses_kitty_apc() {
+        app.np_art_state = None;
+        app.np_art_prep_key = None;
+        return;
+    }
+    if let Some(p) = app.art_picker.as_mut() {
+        p.set_background_color(crate::theme::color_to_rgba(app.theme.surface));
+    }
+    if app.art_cache.is_none() {
+        app.np_art_state = None;
+        app.np_art_prep_key = None;
+        return;
+    }
+    let Some(fp) = app.art_cache_fingerprint else {
+        app.np_art_state = None;
+        app.np_art_prep_key = None;
+        return;
+    };
+    let (_, bytes) = app.art_cache.as_ref().unwrap();
+    let key = (fp, inner.width, inner.height);
+    if app.np_art_prep_key.as_ref() == Some(&key) && app.np_art_state.is_some() {
+        return;
+    }
+    let Some(picker) = app.art_picker.as_ref() else {
+        return;
+    };
+    let Some(tx) = app.ratatui_resize_tx.clone() else {
+        app.np_art_state = None;
+        app.np_art_prep_key = None;
+        return;
+    };
+    // Must match `Picker` / `ImageSource` font (same as Home strip ratatui prep).
+    let fs = picker.font_size();
+    let base_img = match app.art_cache_decoded.as_ref() {
+        Some((cached_fp, img)) if *cached_fp == fp => img.clone(),
+        _ => {
+            let img = match image::load_from_memory(bytes) {
+                Ok(i) => i,
+                Err(_) => {
+                    app.np_art_state = None;
+                    app.np_art_prep_key = None;
+                    app.art_cache_decoded = None;
+                    return;
+                }
+            };
+            app.art_cache_decoded = Some((fp, img.clone()));
+            img
+        }
+    };
+    let img = if matches!(picker.protocol_type(), ProtocolType::Sixel) {
+        let pad = crate::theme::color_to_rgba(app.theme.surface);
+        let fw = fs.0 as u32;
+        let fh = fs.1 as u32;
+        let need_w = inner.width as u32 * fw;
+        let need_h = inner.height as u32 * fh;
+        if (need_w as u128).saturating_mul(need_h as u128)
+            <= crate::ui::art_prepare::MAX_SIXEL_PREP_PIXELS
+        {
+            crate::ui::art_prepare::prepare_art_image_for_exact_pixels_contain_centered(
+                base_img, need_w, need_h, pad,
+            )
+        } else {
+            crate::ui::art_prepare::prepare_art_image_for_rect_contain_centered(
+                base_img, inner, fs, pad,
+            )
+        }
+    } else {
+        crate::ui::art_prepare::prepare_art_image_for_rect(base_img, inner, fs)
+    };
+    let proto = picker.new_resize_protocol(img);
+    app.np_art_state = Some(ThreadProtocol::new(tx, Some(proto)));
+    app.np_art_prep_key = Some(key);
+}
+
+fn render_art_placeholder(app: &mut App, frame: &mut Frame, area: Rect) {
     let t = &app.theme;
     let block = crate::ui::kitty_art::album_art_block()
         .title_style(Style::default().fg(t.dimmed).add_modifier(Modifier::BOLD))
         .border_style(Style::default().fg(t.border))
         .style(Style::default().bg(t.surface));
     frame.render_widget(block, area);
+
+    if app.ratatui_art_ready()
+        && !app.ratatui_uses_kitty_apc()
+        && !app.help_visible
+        && app.config.nowplaying_show_art
+    {
+        let inner = crate::ui::kitty_art::album_art_placeholder_inner(area);
+        if inner.width > 0 && inner.height > 0 {
+            if app.art_picker.as_ref().is_some_and(|p| {
+                matches!(p.protocol_type(), ProtocolType::Sixel)
+            }) {
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(app.theme.surface)),
+                    inner,
+                );
+            }
+            sync_np_ratatui_protocol(app, inner);
+            let img_resize = app.ratatui_stateful_resize();
+            if let Some(ref mut state) = app.np_art_state {
+                // Source is pre-fitted in `art_prepare`; `ratatui_stateful_resize` fills cells (see App).
+                let w = StatefulImage::default().resize(img_resize);
+                frame.render_stateful_widget(w, inner, state);
+            }
+        }
+    }
 }
 
 // ── Visualizer pane ───────────────────────────────────────────────────────────

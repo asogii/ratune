@@ -1,4 +1,5 @@
 pub mod albums;
+pub mod art_prepare;
 pub mod artists;
 pub mod browser;
 pub mod home_tab;
@@ -26,7 +27,7 @@ use home_tab::render_home_tab;
 
 // ── Top-level render ──────────────────────────────────────────────────────────
 
-pub fn render(app: &App, frame: &mut Frame) {
+pub fn render(app: &mut App, frame: &mut Frame) {
     let total_rows = frame.area().height;
 
     match app.active_tab {
@@ -35,13 +36,9 @@ pub fn render(app: &App, frame: &mut Frame) {
             render_home_tab(
                 frame,
                 areas.center,
-                &app.home,
-                &app.config,
+                app,
                 app.accent(),
-                app.kitty_supported,
                 app.help_visible,
-                app.cell_px,
-                &app.theme,
             );
             now_playing::render(app, frame, areas.now_playing);
             status_bar::render(app, frame, areas.status_bar);
@@ -73,6 +70,6 @@ pub fn render(app: &App, frame: &mut Frame) {
     }
     // Popup renders last so it layers on top of everything.
     if app.help_visible {
-        popup::render_help(app, frame);
+        popup::render_help(&*app, frame);
     }
 }

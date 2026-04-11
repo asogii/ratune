@@ -7,7 +7,12 @@ use crate::app::App;
 
 const DEFAULT_QUEUE_TEMPLATE: &str = "{n}  {title:<40}  {artist:<25}  {duration:>5}";
 
-pub fn render(app: &App, frame: &mut Frame, area: Rect, is_active: bool) {
+pub fn render(app: &mut App, frame: &mut Frame, area: Rect, is_active: bool) {
+    let visible = area.height.saturating_sub(2) as usize;
+    let visible = visible.max(1);
+    app.queue_viewport_rows = visible;
+    app.queue.scroll_clamp_cursor_visible(visible);
+
     let t = &app.theme;
     let border_color = if is_active { t.border_active } else { t.border };
     let title_color  = if is_active { app.accent() }    else { t.dimmed };
@@ -82,6 +87,13 @@ fn format_queue_line(template: &str, s: &playterm_subsonic::Song) -> String {
         "artist" => Some(artist.to_string()),
         "album" => Some(album.to_string()),
         "duration" => Some(duration.clone()),
+        "suffix" => Some(
+            s.suffix
+                .as_deref()
+                .or(s.content_type.as_deref())
+                .unwrap_or("")
+                .to_string(),
+        ),
         _ => None,
     })
 }
