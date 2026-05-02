@@ -438,6 +438,9 @@ async fn run_loop(
                     let now_playing_position =
                         ui::layout::placement_from_str(&app.config.now_playing_box_location)
                             .unwrap_or(ui::layout::Placement::Right);
+                    let lyrics_position =
+                        ui::layout::placement_from_str(&app.config.lyrics_location)
+                            .unwrap_or(queue_position);
 
                     let rects = ui::layout::now_playing_rects(
                         center,
@@ -449,6 +452,7 @@ async fn run_loop(
                         app.visualizer_visible,
                         visualizer_position,
                         app.lyrics_visible,
+                        lyrics_position,
                         boxed,
                         now_playing_position,
                     );
@@ -1565,6 +1569,8 @@ fn handle_mouse_click(x: u16, y: u16, app: &mut App, terminal_size: ratatui::lay
                 let now_playing_position =
                     ui::layout::placement_from_str(&app.config.now_playing_box_location)
                         .unwrap_or(ui::layout::Placement::Right);
+                let lyrics_position = ui::layout::placement_from_str(&app.config.lyrics_location)
+                    .unwrap_or(queue_position);
                 let rects = ui::layout::now_playing_rects(
                     center,
                     show_art,
@@ -1575,6 +1581,7 @@ fn handle_mouse_click(x: u16, y: u16, app: &mut App, terminal_size: ratatui::lay
                     app.visualizer_visible,
                     visualizer_position,
                     app.lyrics_visible,
+                    lyrics_position,
                     boxed_np,
                     now_playing_position,
                 );
@@ -1642,6 +1649,8 @@ fn handle_mouse_click(x: u16, y: u16, app: &mut App, terminal_size: ratatui::lay
             let now_playing_position =
                 ui::layout::placement_from_str(&app.config.now_playing_box_location)
                     .unwrap_or(ui::layout::Placement::Right);
+            let lyrics_position = ui::layout::placement_from_str(&app.config.lyrics_location)
+                .unwrap_or(queue_position);
             let rects = ui::layout::now_playing_rects(
                 center,
                 show_art,
@@ -1652,6 +1661,7 @@ fn handle_mouse_click(x: u16, y: u16, app: &mut App, terminal_size: ratatui::lay
                 app.visualizer_visible,
                 visualizer_position,
                 app.lyrics_visible,
+                lyrics_position,
                 boxed_np,
                 now_playing_position,
             );

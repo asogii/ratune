@@ -2329,9 +2329,7 @@ impl App {
             Action::ToggleVisualizer => {
                 if self.active_tab == Tab::NowPlaying && self.config.visualizer_enabled {
                     self.visualizer_visible = !self.visualizer_visible;
-                    if self.visualizer_visible {
-                        self.lyrics_visible = false;
-                    } else {
+                    if !self.visualizer_visible {
                         self.spectrum_bands = vec![0.0; 32];
                         self.waveform.clear();
                         self.visualizer_last_tick = None;

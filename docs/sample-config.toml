@@ -240,14 +240,12 @@ mode = "artists"
 # [ui.nptab] — Now Playing tab overrides
 # -----------------------------------------------------------------------------
 #
-# lyrics / lyrics_enabled / visualizer — set here (NP tab). Defaults: lyrics off, lyrics_enabled on,
-#   visualizer flags under `[ui.nptab.visualizer_pane]`.
+# Lyrics — `[ui.nptab.lyrics_pane]` (enabled / visible / location), same idea as visualizer_pane.
+#   Lyrics and visualizer can both be visible; set each pane's `location` to split them (e.g. left/right).
 # queue_template — Per-row queue format; prefer `[ui.nptab.queue].queue_template`.
 # show_fzf_hint  — Empty-queue hint mentioning library picker when enabled.
 
 [ui.nptab]
-lyrics = false
-lyrics_enabled = true
 queue_template = ""
 show_fzf_hint = false
 
@@ -275,6 +273,16 @@ left_width_percent = 50
 [ui.nptab.queue]
 position = "right"
 # queue_template = "{n}  {title:<40}  {artist:<25}  {duration:>5}"
+
+# [ui.nptab.lyrics_pane]
+# enabled — If false, lyrics cannot be opened. Default: true.
+# visible — Start visible. Default: false.
+# location — "left" | "right" | "full" (dock row). Omitted → same side as queue.
+
+[ui.nptab.lyrics_pane]
+enabled = true
+visible = false
+location = "right"
 
 # [ui.nptab.visualizer_pane]
 # enabled — If false, visualizer cannot be opened. Default: true.

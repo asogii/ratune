@@ -124,6 +124,7 @@ pub fn now_playing_rects(
     visualizer_visible: bool,
     visualizer_position: Placement,
     lyrics_visible: bool,
+    lyrics_position: Placement,
     boxed_layout: bool,
     now_playing_position: Placement,
 ) -> NowPlayingRects {
@@ -131,6 +132,11 @@ pub fn now_playing_rects(
     let queue_pos = Some(queue_position);
     let vz_pos = if visualizer_visible {
         Some(visualizer_position)
+    } else {
+        None
+    };
+    let lyrics_pos = if lyrics_visible {
+        Some(lyrics_position)
     } else {
         None
     };
@@ -143,12 +149,14 @@ pub fn now_playing_rects(
     let art_side = art_pos.and_then(side_from_placement);
     let queue_side = queue_pos.and_then(side_from_placement);
     let vz_side = vz_pos.and_then(side_from_placement);
+    let lyrics_side = lyrics_pos.and_then(side_from_placement);
     let np_side = np_pos.and_then(side_from_placement);
 
     // "Full" means "span horizontally (full-width row)", not "take over everything".
     // We implement this by reserving full-width dock rows at the bottom for dock panes, and
     // full-width main rows at the top for art/queue when configured.
     let vz_full = vz_pos == Some(Placement::Full);
+    let lyrics_full = lyrics_pos == Some(Placement::Full);
     let np_full = np_pos == Some(Placement::Full);
     let art_full = art_pos == Some(Placement::Full);
     let queue_full = queue_pos == Some(Placement::Full);
@@ -156,17 +164,19 @@ pub fn now_playing_rects(
     // Full-width dock rows (visualizer / lyrics / now-playing).
     let dock_full_count = usize::from(vz_full)
         + usize::from(np_full)
-        + usize::from(lyrics_visible && !visualizer_visible && queue_full);
+        + usize::from(lyrics_visible && lyrics_full);
 
     let (main_area, dock_full_rows) = split_main_and_docks(center, dock_full_count);
 
     let uses_left = queue_side == Some(Side::Left)
         || art_side == Some(Side::Left)
         || vz_side == Some(Side::Left)
+        || lyrics_side == Some(Side::Left)
         || np_side == Some(Side::Left);
     let uses_right = queue_side == Some(Side::Right)
         || art_side == Some(Side::Right)
         || vz_side == Some(Side::Right)
+        || lyrics_side == Some(Side::Right)
         || np_side == Some(Side::Right);
     let split = uses_left && uses_right;
 
@@ -178,7 +188,7 @@ pub fn now_playing_rects(
     if vz_full {
         rects.visualizer = dock_iter.next();
     }
-    if lyrics_visible && !visualizer_visible && queue_full {
+    if lyrics_visible && lyrics_full {
         rects.lyrics = dock_iter.next();
     }
     if np_full {
@@ -193,7 +203,7 @@ pub fn now_playing_rects(
         || (!queue_full && queue_side.is_some())
         || vz_side.is_some() && !vz_full
         || np_side.is_some() && !np_full
-        || (lyrics_visible && !visualizer_visible && queue_side.is_some());
+        || (lyrics_visible && lyrics_side.is_some() && !lyrics_full);
     let top_parts = full_main_count + usize::from(has_column_main);
     let main_parts = split_vertical_equal(main_area, top_parts.max(1));
     let mut idx = 0usize;
@@ -217,7 +227,7 @@ pub fn now_playing_rects(
         let has_art = art_side == Some(side);
         let has_vz = vz_side == Some(side) && !vz_full;
         let has_np = np_side == Some(side) && !np_full;
-        let has_lyrics = lyrics_visible && !visualizer_visible && has_queue;
+        let has_lyrics = lyrics_visible && lyrics_side == Some(side) && !lyrics_full;
 
         let docks = u16::from(has_vz) + u16::from(has_np) + u16::from(has_lyrics);
 

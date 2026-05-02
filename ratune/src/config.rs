@@ -400,12 +400,6 @@ pub struct UiBrowseTabSection {
 /// All fields are optional; when present, they override `[ui.row_now_playing]` and built-in defaults.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct UiNpTabSection {
-    /// Start with the lyrics overlay visible (toggle `L`).
-    #[serde(default)]
-    pub lyrics: Option<bool>,
-    /// Whether lyrics can be toggled at all.
-    #[serde(default)]
-    pub lyrics_enabled: Option<bool>,
     /// Queue row template (Now Playing tab queue column). Prefer `[ui.nptab.queue].queue_template`
     /// when grouping with `position`; that key overrides this one when set.
     #[serde(default)]
@@ -422,12 +416,28 @@ pub struct UiNpTabSection {
     /// Queue column placement for the Now Playing tab.
     #[serde(default)]
     pub queue: Option<UiNpTabQueueSection>,
+    /// Lyrics overlay: same shape as [`UiNpTabVisualizerSection`] (`enabled`, `visible`, `location`).
+    #[serde(default)]
+    pub lyrics_pane: Option<UiNpTabLyricsSection>,
     /// Visualizer: feature toggle, startup visibility, pane docking.
     #[serde(default)]
     pub visualizer_pane: Option<UiNpTabVisualizerSection>,
     /// Bottom strip layout + boxed pane text (overrides `row_now_playing`).
     #[serde(default)]
     pub now_playing: Option<UiNpTabNowPlayingSection>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct UiNpTabLyricsSection {
+    /// If false, lyrics cannot be shown or toggled (`L`). Default: true.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Start with the lyrics pane visible (toggle `L`). Default: false.
+    #[serde(default)]
+    pub visible: Option<bool>,
+    /// `left`, `right`, or `full` (full-width dock row). Omitted → same side as the queue column.
+    #[serde(default)]
+    pub location: Option<String>,
 }
 
 /// UI preferences from config.toml.
@@ -713,6 +723,9 @@ pub struct Config {
     pub nowplaying_vertical_fill_top_percent: u8,
     /// Show fzf picker hints in the UI where relevant.
     pub show_fzf_hint: bool,
+    /// Now Playing tab: lyrics pane side when visible (`left`, `right`, or `full`). Defaults to
+    /// the queue column side when omitted in config.
+    pub lyrics_location: String,
     /// Where the visualizer pane appears ("queue" or "art").
     pub visualizer_location: String,
     /// Visualizer type: `spectrum`, `wave`.
@@ -841,6 +854,12 @@ impl Config {
                     "right".into()
                 }
             });
+
+        let lyrics_pane = nptab.and_then(|n| n.lyrics_pane.as_ref());
+        let lyrics_location = lyrics_pane
+            .and_then(|l| l.location.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| nowplaying_queue_position.clone());
 
         let nowplaying_left_width_percent = nptab
             .and_then(|n| n.layout.as_ref())
@@ -977,9 +996,11 @@ impl Config {
             lines
         };
 
-        let lyrics_visible = nptab.and_then(|n| n.lyrics).unwrap_or(false);
-        let lyrics_enabled = nptab
-            .and_then(|n| n.lyrics_enabled)
+        let lyrics_visible = lyrics_pane
+            .and_then(|l| l.visible)
+            .unwrap_or(false);
+        let lyrics_enabled = lyrics_pane
+            .and_then(|l| l.enabled)
             .unwrap_or_else(default_ui_lyrics_enabled);
         let visualizer_visible = nptab
             .and_then(|n| n.visualizer_pane.as_ref())
@@ -1050,6 +1071,7 @@ impl Config {
             nowplaying_left_width_percent,
             nowplaying_vertical_fill_top_percent,
             show_fzf_hint,
+            lyrics_location,
             visualizer_location,
             visualizer_type,
             visualizer_fps,
@@ -1222,8 +1244,6 @@ panels = ["recent_albums", "recent_tracks", "rediscover"]
 mode = "artists"
 
 [ui.nptab]
-lyrics = false
-lyrics_enabled = true
 # show_fzf_hint = false
 # You can also set queue_template here; `[ui.nptab.queue]` wins if both are set.
 
@@ -1239,6 +1259,11 @@ position = "right"
 # One template per queue ROW — `{title}`, `{n}`, `{artist}`, `{album}`, `{duration}`, `{suffix}`.
 # NOT the same syntax as now-playing `lines` above (those use % / $ tags).
 # queue_template = "{n}  {title:<40}  {artist:<25}  {duration:>5}"
+
+[ui.nptab.lyrics_pane]
+enabled = true
+visible = false
+location = "right"
 
 [ui.nptab.visualizer_pane]
 enabled = true
