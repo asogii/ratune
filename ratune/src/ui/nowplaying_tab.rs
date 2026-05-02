@@ -29,8 +29,8 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
     let now_playing_position =
         super::layout::placement_from_str(&app.config.now_playing_box_location)
             .unwrap_or(super::layout::Placement::Right);
-    let lyrics_position = super::layout::placement_from_str(&app.config.lyrics_location)
-        .unwrap_or(queue_position);
+    let lyrics_position =
+        super::layout::placement_from_str(&app.config.lyrics_location).unwrap_or(queue_position);
 
     let rects = super::layout::now_playing_rects(
         area,

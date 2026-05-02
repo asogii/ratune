@@ -996,9 +996,7 @@ impl Config {
             lines
         };
 
-        let lyrics_visible = lyrics_pane
-            .and_then(|l| l.visible)
-            .unwrap_or(false);
+        let lyrics_visible = lyrics_pane.and_then(|l| l.visible).unwrap_or(false);
         let lyrics_enabled = lyrics_pane
             .and_then(|l| l.enabled)
             .unwrap_or_else(default_ui_lyrics_enabled);

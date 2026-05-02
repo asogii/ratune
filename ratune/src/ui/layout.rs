@@ -162,9 +162,8 @@ pub fn now_playing_rects(
     let queue_full = queue_pos == Some(Placement::Full);
 
     // Full-width dock rows (visualizer / lyrics / now-playing).
-    let dock_full_count = usize::from(vz_full)
-        + usize::from(np_full)
-        + usize::from(lyrics_visible && lyrics_full);
+    let dock_full_count =
+        usize::from(vz_full) + usize::from(np_full) + usize::from(lyrics_visible && lyrics_full);
 
     let (main_area, dock_full_rows) = split_main_and_docks(center, dock_full_count);
 
