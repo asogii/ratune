@@ -2766,6 +2766,12 @@ impl App {
                             self.fetch_music_folders();
                         }
                         self.sync_folder_preview_from_left();
+                    } else if matches!(
+                        &self.library.artists,
+                        LoadingState::NotLoaded | LoadingState::Error(_)
+                    ) {
+                        // Cold start in `files` mode never called `fetch_artists`; load when toggling here.
+                        self.fetch_artists();
                     }
                     self.flash_status(match self.browser_browse_mode {
                         BrowseMode::Files => "Browse: folders",
