@@ -35,6 +35,7 @@ Ratune was built to bring together a combination of features often missing from 
 - **Lyrics**: Synced lyrics via LRCLib when available.
 - **Visualizer**: FFT spectrum analyzer.
 - **Fuzzy finder**: Optional library index + external picker (fzf/skim) for fast track selection.
+- **Folder navigation**: Optional Browse layout that follows server music folders for servers that provide it.
 - **Customization**: Keybinds, theme, layout, now-playing lines, queue row template inspired by ncmpcpp.
 - **Integration**: Linux MPRIS (media keys, `playerctl`).
 
@@ -199,6 +200,21 @@ preset = "dynamic"
 
 Remapping is done in `[keybinds]`; colors in `[theme]`; now-playing strip vs queue are different keys — see the sample and in-app help (`i`).
 
+### Folder navigation (Browse)
+
+When enabled, the Browse tab can switch between the usual artist / album / track columns and a folder layout that mirrors how your server organizes files on disk (or per-library roots). This uses the Subsonic APIs `getMusicFolders`, `getIndexes`, and `getMusicDirectory` (tested with Navidrome and [gonic](https://github.com/sentriz/gonic)).
+
+**Enable in config** (`[ui.browsetab]` in [`docs/sample-config.toml`](docs/sample-config.toml)):
+
+```toml
+[ui.browsetab]
+folder_navigation = true
+# mode = "artists"   # default on startup (default)
+# mode = "files"     # start in folder view when folder_navigation is true
+```
+
+**Toggle at runtime:** default **`Ctrl+b`** (`toggle_folder_browse` in `[keybinds]`). Switches between folder view and artist browsing and jumps to the Browse tab. If you start in `files` mode, the first toggle to artists loads the artist list if it was not fetched yet.
+
 ---
 
 ## Default keybinds
@@ -224,6 +240,7 @@ These are defaults; everything is overridable in `config.toml`. Press `i` in the
 | `P` | Playlist overlay (Browse) |
 | `>` | Add to playlist (Browse) |
 | `Ctrl+f` | Library fzf picker (if configured) |
+| `Ctrl+b` | Toggle folder / artist browse (if `[ui.browsetab] folder_navigation = true`) |
 | `t` | Toggle dynamic theme |
 | `i` | Help |
 | `q` | Quit |
