@@ -3,7 +3,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, BrowserColumn};
 use crate::state::{LibraryState, LoadingState};
 use ratune_subsonic::Album;
 
@@ -61,20 +61,21 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect, is_active: bool) {
                 None => a.name.clone(),
             };
 
-            let visible: Vec<(usize, String)> = if let Some(q) = &app.search_filter {
-                albums
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, a)| a.name.to_lowercase().contains(q.as_str()))
-                    .map(|(i, a)| (i, make_label(a)))
-                    .collect()
-            } else {
-                albums
-                    .iter()
-                    .enumerate()
-                    .map(|(i, a)| (i, make_label(a)))
-                    .collect()
-            };
+            let visible: Vec<(usize, String)> =
+                if let Some(q) = app.browser_column_filter(BrowserColumn::Albums) {
+                    albums
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, a)| a.name.to_lowercase().contains(q))
+                        .map(|(i, a)| (i, make_label(a)))
+                        .collect()
+                } else {
+                    albums
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| (i, make_label(a)))
+                        .collect()
+                };
 
             let items: Vec<ListItem> = if visible.is_empty() {
                 vec![ListItem::new("No matches").style(Style::default().fg(t.dimmed))]
