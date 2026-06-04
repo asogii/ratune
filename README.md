@@ -155,7 +155,7 @@ On first start, ratune creates a short default file at `~/.config/ratune/config.
 
 Set Subsonic **url** and **username**, then choose how to supply the secret (most secure first):
 
-1. **OS keyring (default)** — leave `password = ""` or remove field entirely.
+1. **OS keyring (default)** — leave `password = ""` or remove field entirely. (**NOTE**: This option currently uses keyutils on Linux, to be reconsidered)
 2. **`password_command`** — run a shell command; stdout is the secret (e.g. `secret-tool`, `pass`, KeePassXC CLI).
 3. **Plaintext** — `password = "..."` in the file, or env vars (convenient for scripts; avoid in shared configs).
 
@@ -265,6 +265,7 @@ Same options for secret handling as Subsonic password are provided.
 
 To not store secrets in the file (synced dotfiles, shared machines, etc.), leave `api_secret` / `session_key` empty and use either command in config or ratune functions to save to the keyring.
 
+
 | Secret | Resolution order |
 |--------|------------------|
 | `api_secret` | config → `api_secret_command` → OS keyring (`lastfm\|api_secret`) |
@@ -272,8 +273,10 @@ To not store secrets in the file (synced dotfiles, shared machines, etc.), leave
 
 Keyring entries use service **`ratune`**. Env vars (`LASTFM_API_SECRET`, `LASTFM_SESSION_KEY`, …) override the file, same as Subsonic.
 
+**IMPORTANT NOTE**: `--save-keyring` currently uses keyutils in Linux (to be changed soon). This is not recommended, consider using the command options in config instead.
+
 ```sh
-# save directly to keyring
+# save directly to keyutils
 ratune scrobble-api-secret --save-keyring
 ratune scrobble-auth --save-keyring
 ```
