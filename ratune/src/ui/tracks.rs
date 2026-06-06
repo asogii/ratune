@@ -5,6 +5,7 @@ use ratatui::Frame;
 
 use crate::app::{App, BrowserColumn};
 use crate::state::{LibraryState, LoadingState};
+use crate::theme::style_with_bg;
 
 pub fn render(app: &mut App, frame: &mut Frame, area: Rect, is_active: bool) {
     let t = &app.theme;
@@ -34,7 +35,7 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect, is_active: bool) {
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(border_style)
-        .style(Style::default().bg(t.surface));
+        .style(style_with_bg(t.surface));
 
     let album_id = match app.library.current_album() {
         Some(a) => a.id.clone(),
@@ -115,7 +116,7 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect, is_active: bool) {
                         .add_modifier(Modifier::BOLD),
                 )
                 .highlight_symbol("▶ ")
-                .style(Style::default().bg(t.surface));
+                .style(style_with_bg(t.surface));
 
             let vh = area.height.saturating_sub(2) as usize;
             let vh = vh.max(1);
