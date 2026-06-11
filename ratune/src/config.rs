@@ -105,6 +105,16 @@ pub struct KeybindsSection {
     pub home_section_prev: Option<String>,
     /// Home: re-roll / refresh. Default: r
     pub home_refresh: Option<String>,
+    /// Home: append current selection to queue. Default: a
+    pub home_add_to_queue: Option<String>,
+    /// Home: append ALL items in current section to queue. Default: Shift+a
+    pub home_add_all_to_queue: Option<String>,
+    /// Home: replace queue with ALL items in current section. Default: Shift+r
+    pub home_replace_all: Option<String>,
+    /// Home: prepend current selection to queue. Default: p
+    pub home_prepend_to_queue: Option<String>,
+    /// Home: prepend ALL items in current section to queue. Default: Shift+p
+    pub home_prepend_all: Option<String>,
     /// Browse: toggle folder navigation (requires `[ui.browsetab] folder_navigation`). Default: Ctrl+b
     pub toggle_folder_browse: Option<String>,
 }
@@ -1452,6 +1462,12 @@ max_bit_rate = 0   # 0 = unlimited; set e.g. 320 to cap streaming bitrate
 # home_section_next = "Shift+j"
 # home_section_prev = "Shift+k"
 # home_refresh = "r"
+# # Home tab: queue operations
+# home_add_to_queue     = "a"         # append current selection
+# home_add_all_to_queue = "Shift+a"   # append ALL items in section
+# home_replace_all      = "Shift+r"   # replace queue with ALL items
+# home_prepend_to_queue = "p"         # prepend current selection
+# home_prepend_all      = "Shift+p"   # prepend ALL items
 
 [theme]
 # accent        = "#ff8c00"   # highlighted items, active borders, progress fill

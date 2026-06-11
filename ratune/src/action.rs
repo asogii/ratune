@@ -83,6 +83,16 @@ pub enum Action {
     HomeAlbumPlay,
     /// Append the selected album (strip) to queue without clearing.
     HomeAlbumAddToQueue,
+    /// Home tab: append current selection (track/album/artist) to queue.
+    HomeAddToQueue,
+    /// Home tab: append ALL items in current section to queue.
+    HomeAddAllToQueue,
+    /// Home tab: replace queue with ALL items in current section.
+    HomeReplaceAll,
+    /// Home tab: prepend current selection to queue.
+    HomePrependToQueue,
+    /// Home tab: prepend ALL items in current section to queue.
+    HomePrependAll,
     /// Toggle the playlist browser overlay.
     TogglePlaylistOverlay,
     /// Scroll up within the playlist overlay (list or tracks pane).

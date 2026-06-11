@@ -10,17 +10,112 @@ use std::collections::VecDeque;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::num::NonZero;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::header::ACCEPT_ENCODING;
-use rodio::{Decoder, DeviceSinkBuilder, Player};
+use magnum::container::ogg::OpusSourceOgg;
+use rodio::source::SeekError;
+use rodio::{ChannelCount, Decoder, DeviceSinkBuilder, Player, SampleRate, Source};
 
 use crate::tap::SampleTap;
 
 type SampleBuffer = Arc<Mutex<VecDeque<f32>>>;
+
+/// Adapts magnum's OpusSourceOgg to rodio 0.22's Source trait.
+///
+/// magnum's built-in `with_rodio` feature targets rodio 0.14 and is not
+/// compatible with the 0.22 version used elsewhere in this crate.
+struct MagnumOpusSource {
+    inner: OpusSourceOgg<Cursor<Vec<u8>>>,
+}
+
+impl Iterator for MagnumOpusSource {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        self.inner.next()
+    }
+}
+
+impl Source for MagnumOpusSource {
+    fn current_span_len(&self) -> Option<usize> {
+        Some(240) // Opus: 120 samples/channel × 2 channels
+    }
+
+    fn channels(&self) -> ChannelCount {
+        NonZero::new(self.inner.metadata.channel_count.into()).unwrap()
+    }
+
+    fn sample_rate(&self) -> SampleRate {
+        NonZero::new(48_000u32).unwrap() // Opus always decodes at 48 kHz
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None // magnum does not calculate total duration
+    }
+
+    fn try_seek(&mut self, _pos: Duration) -> Result<(), SeekError> {
+        Err(SeekError::NotSupported {
+            underlying_source: "magnum OpusSourceOgg",
+        })
+    }
+}
+
+/// Unified source type: Symphonia for most formats, magnum for Opus Ogg.
+enum DecodedSource {
+    Symphonia(Decoder<Cursor<Vec<u8>>>),
+    MagnumOpus(MagnumOpusSource),
+}
+
+impl Iterator for DecodedSource {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        match self {
+            Self::Symphonia(d) => d.next(),
+            Self::MagnumOpus(d) => d.next(),
+        }
+    }
+}
+
+impl Source for DecodedSource {
+    fn current_span_len(&self) -> Option<usize> {
+        match self {
+            Self::Symphonia(d) => d.current_span_len(),
+            Self::MagnumOpus(d) => d.current_span_len(),
+        }
+    }
+
+    fn channels(&self) -> ChannelCount {
+        match self {
+            Self::Symphonia(d) => d.channels(),
+            Self::MagnumOpus(d) => d.channels(),
+        }
+    }
+
+    fn sample_rate(&self) -> SampleRate {
+        match self {
+            Self::Symphonia(d) => d.sample_rate(),
+            Self::MagnumOpus(d) => d.sample_rate(),
+        }
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        match self {
+            Self::Symphonia(d) => d.total_duration(),
+            Self::MagnumOpus(d) => d.total_duration(),
+        }
+    }
+
+    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+        match self {
+            Self::Symphonia(d) => d.try_seek(pos),
+            Self::MagnumOpus(d) => d.try_seek(pos),
+        }
+    }
+}
 
 // ── Public channel types ──────────────────────────────────────────────────────
 
@@ -512,13 +607,27 @@ fn fetch_track_bytes(url: &str, accept_identity: bool) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-fn read_cached_and_decode(path: &std::path::Path) -> Result<Decoder<Cursor<Vec<u8>>>> {
+fn read_cached_and_decode(path: &std::path::Path) -> Result<DecodedSource> {
     let bytes =
         std::fs::read(path).with_context(|| format!("reading cached track {}", path.display()))?;
-    build_symphonia_decoder(bytes)
+    build_decoder(bytes)
 }
 
-fn build_symphonia_decoder(bytes: Vec<u8>) -> Result<Decoder<Cursor<Vec<u8>>>> {
+fn build_decoder(bytes: Vec<u8>) -> Result<DecodedSource> {
+    // Quick check for Opus in Ogg container: header starts with "OggS" and
+    // the identification packet's magic is "OpusHead".
+    let is_opus = bytes.len() > 36
+        && bytes.starts_with(b"OggS")
+        && bytes.windows(8).any(|w| w == b"OpusHead");
+
+    if is_opus {
+        let cursor = Cursor::new(bytes);
+        let source = OpusSourceOgg::new(cursor)
+            .context("decoding Opus audio with magnum")?;
+        return Ok(DecodedSource::MagnumOpus(MagnumOpusSource { inner: source }));
+    }
+
+    // Fall back to Symphonia for all other formats (MP3, FLAC, Vorbis, AAC, etc.).
     let byte_len = bytes.len() as u64;
     let cursor = Cursor::new(bytes);
     Decoder::builder()
@@ -526,10 +635,11 @@ fn build_symphonia_decoder(bytes: Vec<u8>) -> Result<Decoder<Cursor<Vec<u8>>>> {
         .with_byte_len(byte_len)
         .with_coarse_seek(true)
         .build()
+        .map(DecodedSource::Symphonia)
         .context("decoding audio (unsupported or corrupt file?)")
 }
 
-fn download_and_decode(url: &str) -> Result<Decoder<Cursor<Vec<u8>>>> {
+fn download_and_decode(url: &str) -> Result<DecodedSource> {
     // Download the full track into RAM so symphonia gets an unambiguously
     // seekable Cursor<Vec<u8>>.  StreamingReader over a BufReader was technically
     // seekable but symphonia's demuxer cached seekability as false during probe,
@@ -546,7 +656,7 @@ fn download_and_decode(url: &str) -> Result<Decoder<Cursor<Vec<u8>>>> {
         }
         // After a few normal tries (compressed transfer), ask for identity once.
         let identity = attempt == 3;
-        match fetch_track_bytes(url, identity).and_then(build_symphonia_decoder) {
+        match fetch_track_bytes(url, identity).and_then(build_decoder) {
             Ok(decoder) => return Ok(decoder),
             Err(e) => last_err = Some(e),
         }

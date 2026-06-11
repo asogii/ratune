@@ -71,14 +71,14 @@ impl Theme {
                 }
             }
             ThemePreset::Static => {
-                let chrome = Color::Rgb(26, 26, 26);
+                let chrome = Color::Reset;
                 Self {
                     preset,
                     accent: Color::Rgb(255, 140, 0),
                     background: chrome,
                     tab_bar: chrome,
                     status_bar: chrome,
-                    surface: Color::Rgb(22, 22, 22),
+                    surface: Color::Reset,
                     foreground: Color::Rgb(212, 208, 200),
                     dimmed: Color::Rgb(90, 88, 88),
                     border: Color::Rgb(37, 37, 37),
@@ -87,14 +87,14 @@ impl Theme {
                 }
             }
             ThemePreset::Dynamic => {
-                let chrome = Color::Rgb(26, 26, 26);
+                let chrome = Color::Reset;
                 Self {
                     preset,
                     accent: Color::Rgb(255, 140, 0),
                     background: chrome,
                     tab_bar: chrome,
                     status_bar: chrome,
-                    surface: Color::Rgb(22, 22, 22),
+                    surface: Color::Reset,
                     foreground: Color::Rgb(212, 208, 200),
                     dimmed: Color::Rgb(90, 88, 88),
                     border: Color::Rgb(37, 37, 37),
@@ -260,7 +260,7 @@ mod tests {
         let t = Theme::from_section(&sec);
         assert_eq!(t.preset, ThemePreset::Static);
         assert_eq!(t.accent, Color::Indexed(3));
-        assert_eq!(t.background, Color::Rgb(26, 26, 26));
+        assert_eq!(t.background, Color::Reset);
     }
 
     #[test]

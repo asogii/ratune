@@ -16,6 +16,7 @@ use crate::ui::kitty_art::{
     art_strip_layout, art_strip_slot_thumb_rect, art_strip_thumb_hit, KITTY_STRIP_MAX_SLOTS,
     STRIP_GAP_COLS,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ── Relative time formatting ──────────────────────────────────────────────────
 
@@ -333,12 +334,10 @@ fn render_recent_albums_list(
         let idx = scroll_offset + row;
         let a = &albums[idx];
         let text = format!(
-            " {:>2}. {:<artist_w$} {:<album_w$}",
+            " {:>2}. {} {}",
             idx + 1,
-            truncate(&a.artist_name, artist_w),
-            truncate(&a.album_name, album_w),
-            artist_w = artist_w,
-            album_w = album_w,
+            pad_or_truncate(&a.artist_name, artist_w),
+            pad_or_truncate(&a.album_name, album_w),
         );
         let selected = is_active && idx == selected_index;
         let style = if selected {
@@ -610,13 +609,11 @@ fn render_recent_tracks_block(
             let track_w = ((inner.width as usize).saturating_sub(8) * 40 / 100).max(10);
             let artist_w = ((inner.width as usize).saturating_sub(8) * 30 / 100).max(8);
             let text = format!(
-                " {:>2}. {:<track_w$} {:<artist_w$} {}",
+                " {:>2}. {} {} {}",
                 i + 1,
-                truncate(&record.track_name, track_w),
-                truncate(&record.artist_name, artist_w),
+                pad_or_truncate(&record.track_name, track_w),
+                pad_or_truncate(&record.artist_name, artist_w),
                 rel,
-                track_w = track_w,
-                artist_w = artist_w,
             );
             let selected = is_active && home.selected_index == i;
             let style = if selected {
@@ -691,31 +688,43 @@ fn render_rediscover_block(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Truncate `s` to at most `max` characters, adding `…` if truncated.
+/// Truncate `s` to at most `max` columns (visual width), adding `…` if truncated.
 fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    if s.chars().count() <= max {
+    let w = UnicodeWidthStr::width(s);
+    if w <= max {
         s.to_string()
     } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        let mut out = String::new();
+        let mut col = 0usize;
+        // Leave room for the ellipsis (1 column wide)
+        let budget = max.saturating_sub(1);
+        for c in s.chars() {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if col + cw > budget {
+                break;
+            }
+            out.push(c);
+            col += cw;
+        }
         out.push('\u{2026}'); // …
         out
     }
 }
 
-/// Pad `s` to exactly `width` chars, or truncate with `…` if longer.
+/// Pad `s` to exactly `width` columns (visual width), or truncate with `…` if longer.
 fn pad_or_truncate(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let count = s.chars().count();
-    if count == width {
+    let w = UnicodeWidthStr::width(s);
+    if w == width {
         s.to_string()
-    } else if count < width {
+    } else if w < width {
         let mut out = s.to_string();
-        for _ in 0..(width - count) {
+        for _ in 0..(width - w) {
             out.push(' ');
         }
         out

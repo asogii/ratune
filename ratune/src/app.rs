@@ -3395,6 +3395,12 @@ impl App {
                     }
                 }
             }
+            // ── Home tab general queue operations ─────────────────────────────────
+            Action::HomeAddToQueue => self.home_add_to_queue(),
+            Action::HomeAddAllToQueue => self.home_add_all_to_queue(false),
+            Action::HomeReplaceAll => self.home_add_all_to_queue(true),
+            Action::HomePrependToQueue => self.home_prepend_to_queue(),
+            Action::HomePrependAll => self.home_prepend_all(),
             Action::ToggleDynamicTheme => {
                 if matches!(self.theme.preset, crate::config::ThemePreset::Terminal) {
                     // In terminal/OS mode we inherit colors from the terminal; don't override.
@@ -4068,6 +4074,204 @@ impl App {
                 self.active_tab = Tab::Browser;
                 self.apply_pending_artist_select();
                 self.clear_browser_search();
+            }
+        }
+    }
+
+    // ── Home tab queue helpers ─────────────────────────────────────────────────
+
+    /// Build a minimal Song from a PlayRecord, used to enqueue recent tracks.
+    fn song_from_play_record(&self, record: &PlayRecord) -> ratune_subsonic::Song {
+        ratune_subsonic::Song {
+            id: record.song_id.clone(),
+            title: record.track_name.clone(),
+            artist: Some(record.artist_name.clone()),
+            artist_id: Some(record.artist_id.clone()),
+            album: Some(record.album_name.clone()),
+            album_id: Some(record.album_id.clone()),
+            duration: Some(record.duration_secs as u32),
+            track: None,
+            disc_number: None,
+            year: None,
+            genre: None,
+            cover_art: None,
+            path: None,
+            suffix: None,
+            content_type: None,
+            bit_rate: None,
+            size: None,
+            starred: None,
+        }
+    }
+
+    /// Home tab `a`: append current selection to queue.
+    fn home_add_to_queue(&mut self) {
+        if self.active_tab != Tab::Home {
+            return;
+        }
+        match self.home.active_section {
+            HomeSection::RecentAlbums => {
+                let idx = self.home.album_selected_index;
+                if let Some(album) = self.home.recent_albums.get(idx) {
+                    self.fetch_and_append_album_to_queue(album.album_id.clone());
+                }
+            }
+            HomeSection::RecentTracks => {
+                let idx = self.home.selected_index;
+                if let Some(record) = self.home.recent_tracks.get(idx).cloned() {
+                    let was_empty = self.queue.songs.is_empty();
+                    let song = self.song_from_play_record(&record);
+                    self.queue.push(song);
+                    if was_empty {
+                        self.queue.cursor = 0;
+                        self.play_current();
+                    }
+                }
+            }
+            HomeSection::TopArtists => {}
+            HomeSection::Rediscover => {
+                // Navigate to Browser with the artist pre-selected.
+                if let Some((_, artist_name)) = self.home.rediscover.get(self.home.selected_index) {
+                    self.pending_artist_select = Some(artist_name.clone());
+                    self.active_tab = Tab::Browser;
+                    self.apply_pending_artist_select();
+                    self.clear_browser_search();
+                }
+            }
+        }
+    }
+
+    /// Home tab `A` / `R`: append ALL items to queue, or replace (clear + play).
+    fn home_add_all_to_queue(&mut self, replace: bool) {
+        if self.active_tab != Tab::Home {
+            return;
+        }
+        if replace {
+            self.queue.songs.clear();
+        }
+        match self.home.active_section {
+            HomeSection::RecentTracks => {
+                for record in &self.home.recent_tracks {
+                    let song = self.song_from_play_record(record);
+                    self.queue.push(song);
+                }
+                if !self.queue.songs.is_empty() && replace {
+                    self.queue.cursor = 0;
+                    self.queue.scroll = 0;
+                    self.play_current();
+                }
+            }
+            HomeSection::RecentAlbums => {
+                let ids: Vec<String> = self
+                    .home
+                    .recent_albums
+                    .iter()
+                    .map(|a| a.album_id.clone())
+                    .collect();
+                for album_id in ids {
+                    self.fetch_and_append_album_to_queue(album_id);
+                }
+            }
+            HomeSection::TopArtists => {}
+            HomeSection::Rediscover => {
+                let artists: Vec<(String, String)> = self.home.rediscover.clone();
+                for (artist_id, _) in &artists {
+                    self.fetch_all_tracks_for_artist(artist_id.clone(), false, false);
+                }
+            }
+        }
+    }
+
+    /// Home tab `p`: prepend current selection to queue.
+    fn home_prepend_to_queue(&mut self) {
+        if self.active_tab != Tab::Home {
+            return;
+        }
+        match self.home.active_section {
+            HomeSection::RecentTracks => {
+                if let Some(record) = self.home.recent_tracks.get(self.home.selected_index) {
+                    let song = self.song_from_play_record(record);
+                    self.queue.prepend_songs(vec![song]);
+                }
+            }
+            HomeSection::RecentAlbums => {
+                // Prepend selected album via async fetch with prepend=true
+                let idx = self.home.album_selected_index;
+                if let Some(album) = self.home.recent_albums.get(idx) {
+                    let client = self.subsonic.clone();
+                    let tx = self.library_tx.clone();
+                    let album_id = album.album_id.clone();
+                    tokio::spawn(async move {
+                        match client.get_album(&album_id).await {
+                            Ok(album) => {
+                                let mut songs = album.song;
+                                songs.sort_by_key(|s| (s.disc_number.unwrap_or(1), s.track.unwrap_or(0)));
+                                let _ = tx
+                                    .send(LibraryUpdate::AllTracksForArtist {
+                                        songs,
+                                        start_playing: false,
+                                        prepend: true,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => eprintln!("home_prepend_album({album_id}): {e}"),
+                        }
+                    });
+                }
+            }
+            HomeSection::TopArtists => {}
+            HomeSection::Rediscover => {
+                // Prepend all tracks for the selected artist.
+                if let Some((artist_id, _)) = self.home.rediscover.get(self.home.selected_index) {
+                    self.fetch_all_tracks_for_artist(artist_id.clone(), false, true);
+                }
+            }
+        }
+    }
+
+    /// Home tab `P`: prepend ALL items in current section to queue.
+    fn home_prepend_all(&mut self) {
+        if self.active_tab != Tab::Home {
+            return;
+        }
+        match self.home.active_section {
+            HomeSection::TopArtists => {}
+            HomeSection::RecentTracks => {
+                let songs: Vec<ratune_subsonic::Song> = self
+                    .home
+                    .recent_tracks
+                    .iter()
+                    .map(|r| self.song_from_play_record(r))
+                    .collect();
+                self.queue.prepend_songs(songs);
+            }
+            HomeSection::RecentAlbums => {
+                for album in &self.home.recent_albums {
+                    let client = self.subsonic.clone();
+                    let tx = self.library_tx.clone();
+                    let album_id = album.album_id.clone();
+                    tokio::spawn(async move {
+                        match client.get_album(&album_id).await {
+                            Ok(album) => {
+                                let mut songs = album.song;
+                                songs.sort_by_key(|s| (s.disc_number.unwrap_or(1), s.track.unwrap_or(0)));
+                                let _ = tx
+                                    .send(LibraryUpdate::AllTracksForArtist {
+                                        songs,
+                                        start_playing: false,
+                                        prepend: true,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => eprintln!("home_prepend_all_albums({album_id}): {e}"),
+                        }
+                    });
+                }
+            }
+            HomeSection::Rediscover => {
+                for (artist_id, _) in &self.home.rediscover {
+                    self.fetch_all_tracks_for_artist(artist_id.clone(), false, true);
+                }
             }
         }
     }

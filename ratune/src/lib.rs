@@ -195,7 +195,7 @@ pub async fn run() -> Result<()> {
 
         match ratatui_image::picker::Picker::from_query_stdio() {
             Ok(mut p) => {
-                p.set_background_color(theme::color_to_rgba(app.theme.surface));
+                p.set_background_color(theme::surface_pad_rgba(app.theme.surface));
                 app.cell_px = Some(p.font_size());
                 app.art_picker = Some(p);
             }
@@ -1279,14 +1279,27 @@ fn map_key(
                 return Action::HomeAlbumPlay;
             }
         }
+        // Home: queue operations (a/A/R/p/P) — work across all sections (RecentAlbums, RecentTracks, Rediscover).
+        if kb.home_add_to_queue.matches(code, modifiers) {
+            return Action::HomeAddToQueue;
+        }
+        if kb.home_add_all_to_queue.matches(code, modifiers) {
+            return Action::HomeAddAllToQueue;
+        }
+        if kb.home_replace_all.matches(code, modifiers) {
+            return Action::HomeReplaceAll;
+        }
+        if kb.home_prepend_to_queue.matches(code, modifiers) {
+            return Action::HomePrependToQueue;
+        }
+        if kb.home_prepend_all.matches(code, modifiers) {
+            return Action::HomePrependAll;
+        }
         if kb.column_left.matches(code, modifiers) {
             return Action::HomeAlbumLeft;
         }
         if kb.column_right.matches(code, modifiers) {
             return Action::HomeAlbumRight;
-        }
-        if kb.add_track.matches(code, modifiers) {
-            return Action::HomeAlbumAddToQueue;
         }
     }
 

@@ -17,3 +17,4 @@ release = false
 anyhow = "1"
 reqwest = { version = "0.12", features = ["blocking"] }
 rodio = { version = "0.22", default-features = false, features = ["playback", "symphonia-all"] }
+magnum = "1"

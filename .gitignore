@@ -1,3 +1,5 @@
 /target/
 docs/CONTEXT.md
 /bin/
+reasonix.toml
+.codegraph

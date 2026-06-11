@@ -181,6 +181,16 @@ pub struct Keybinds {
     pub home_section_next: KeySpec,
     pub home_section_prev: KeySpec,
     pub home_refresh: KeySpec,
+    /// Home: append current selection to queue.
+    pub home_add_to_queue: KeySpec,
+    /// Home: append ALL items in current section to queue.
+    pub home_add_all_to_queue: KeySpec,
+    /// Home: replace queue with ALL items in current section.
+    pub home_replace_all: KeySpec,
+    /// Home: prepend current selection to queue.
+    pub home_prepend_to_queue: KeySpec,
+    /// Home: prepend ALL items in current section to queue.
+    pub home_prepend_all: KeySpec,
     /// `None` = disabled — folder toggle from keybinds
     pub toggle_folder_browse: Option<KeySpec>,
 }
@@ -389,6 +399,35 @@ impl Keybinds {
             home_refresh: resolve(
                 sec.home_refresh.as_deref(),
                 KeySpec::new(KeyCode::Char('r')),
+            ),
+            home_add_to_queue: resolve(
+                sec.home_add_to_queue.as_deref(),
+                KeySpec::new(KeyCode::Char('a')),
+            ),
+            home_add_all_to_queue: resolve(
+                sec.home_add_all_to_queue.as_deref(),
+                KeySpec {
+                    code: KeyCode::Char('a'),
+                    modifiers: KeyModifiers::SHIFT,
+                },
+            ),
+            home_replace_all: resolve(
+                sec.home_replace_all.as_deref(),
+                KeySpec {
+                    code: KeyCode::Char('r'),
+                    modifiers: KeyModifiers::SHIFT,
+                },
+            ),
+            home_prepend_to_queue: resolve(
+                sec.home_prepend_to_queue.as_deref(),
+                KeySpec::new(KeyCode::Char('p')),
+            ),
+            home_prepend_all: resolve(
+                sec.home_prepend_all.as_deref(),
+                KeySpec {
+                    code: KeyCode::Char('p'),
+                    modifiers: KeyModifiers::SHIFT,
+                },
             ),
             toggle_folder_browse,
         }
