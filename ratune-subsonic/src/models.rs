@@ -553,6 +553,49 @@ pub(crate) struct ScanStatusBody {
     pub scan_status: Option<ScanStatus>,
 }
 
+// ── Starred (getStarred) ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub(crate) struct StarredEnvelope {
+    #[serde(rename = "subsonic-response")]
+    pub response: StarredBody,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct StarredBody {
+    pub status: String,
+    pub error: Option<SubsonicError>,
+    pub starred: Option<Starred>,
+}
+
+#[derive(Deserialize)]
+pub struct Starred {
+    #[serde(default)]
+    pub song: Vec<Song>,
+}
+
+// ── RandomSongs (getRandomSongs) ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub(crate) struct RandomSongsEnvelope {
+    #[serde(rename = "subsonic-response")]
+    pub response: RandomSongsBody,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RandomSongsBody {
+    pub status: String,
+    pub error: Option<SubsonicError>,
+    #[serde(rename = "randomSongs")]
+    pub random_songs: Option<RandomSongs>,
+}
+
+#[derive(Deserialize)]
+pub struct RandomSongs {
+    #[serde(default)]
+    pub song: Vec<Song>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

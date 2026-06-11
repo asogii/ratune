@@ -410,6 +410,18 @@ pub struct PlaybackState {
     /// True once a `PlayUrl` has been sent to the engine for this track.
     /// False after restore (current_song is set but engine has nothing loaded).
     pub player_loaded: bool,
+    /// Playback repeat mode: none -> repeat-all -> repeat-one -> none
+    pub repeat_mode: RepeatMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RepeatMode {
+    #[default]
+    None,
+    /// Repeat the entire queue.
+    All,
+    /// Repeat the current track.
+    One,
 }
 
 #[cfg(test)]

@@ -78,6 +78,8 @@ pub struct KeybindsSection {
     pub go_to_browser: Option<String>,
     /// Jump to NowPlaying tab (default: '3')
     pub go_to_nowplaying: Option<String>,
+    /// Jump to Playlists tab (default: '4')
+    pub go_to_playlists: Option<String>,
     pub quit: Option<String>,
     /// Fuzzy track picker (metadata index). Default: Ctrl+f
     pub library_fzf: Option<String>,
@@ -99,22 +101,22 @@ pub struct KeybindsSection {
     pub browser_add_to_playlist: Option<String>,
     /// Playlist overlay (tracks pane): remove highlighted track. Default: <
     pub remove_from_playlist: Option<String>,
+    /// Queue: move track up. Default: Ctrl+Up
+    pub queue_move_up: Option<String>,
+    /// Queue: move track down. Default: Ctrl+Down
+    pub queue_move_down: Option<String>,
+    /// Playlists tab: toggle count (Favorites/Random). Default: e
+    pub playlists_toggle_count: Option<String>,
+    /// Toggle repeat mode. Default: r
+    pub toggle_repeat_mode: Option<String>,
+    /// Toggle favorite for current track. Default: f
+    pub toggle_favorite: Option<String>,
     /// Home: next panel section. Default: Shift+j (`J` in TOML is fine)
     pub home_section_next: Option<String>,
     /// Home: previous panel section. Default: Shift+k
     pub home_section_prev: Option<String>,
     /// Home: re-roll / refresh. Default: r
     pub home_refresh: Option<String>,
-    /// Home: append current selection to queue. Default: a
-    pub home_add_to_queue: Option<String>,
-    /// Home: append ALL items in current section to queue. Default: Shift+a
-    pub home_add_all_to_queue: Option<String>,
-    /// Home: replace queue with ALL items in current section. Default: Shift+r
-    pub home_replace_all: Option<String>,
-    /// Home: prepend current selection to queue. Default: p
-    pub home_prepend_to_queue: Option<String>,
-    /// Home: prepend ALL items in current section to queue. Default: Shift+p
-    pub home_prepend_all: Option<String>,
     /// Browse: toggle folder navigation (requires `[ui.browsetab] folder_navigation`). Default: Ctrl+b
     pub toggle_folder_browse: Option<String>,
 }
@@ -1462,12 +1464,6 @@ max_bit_rate = 0   # 0 = unlimited; set e.g. 320 to cap streaming bitrate
 # home_section_next = "Shift+j"
 # home_section_prev = "Shift+k"
 # home_refresh = "r"
-# # Home tab: queue operations
-# home_add_to_queue     = "a"         # append current selection
-# home_add_all_to_queue = "Shift+a"   # append ALL items in section
-# home_replace_all      = "Shift+r"   # replace queue with ALL items
-# home_prepend_to_queue = "p"         # prepend current selection
-# home_prepend_all      = "Shift+p"   # prepend ALL items
 
 [theme]
 # accent        = "#ff8c00"   # highlighted items, active borders, progress fill

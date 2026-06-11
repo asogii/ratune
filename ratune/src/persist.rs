@@ -35,13 +35,29 @@ pub struct SavedState {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn state_path() -> Result<PathBuf> {
-    let dir = if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+    let dir = if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
         PathBuf::from(xdg).join("ratune")
     } else {
         let home = std::env::var("HOME").context("HOME env var not set")?;
-        PathBuf::from(home).join(".config").join("ratune")
+        // Per XDG Base Directory Specification, fallback is ~/.local/state
+        PathBuf::from(home).join(".local").join("state").join("ratune")
     };
+    std::fs::create_dir_all(&dir).context("creating state directory")?;
     Ok(dir.join("state.json"))
+}
+
+/// Return the directory for locally saved playlists (`<state_dir>/playlists/`).
+pub fn playlists_dir() -> std::io::Result<std::path::PathBuf> {
+    let base = if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        std::path::PathBuf::from(xdg).join("ratune")
+    } else if let Ok(home) = std::env::var("HOME") {
+        std::path::PathBuf::from(home).join(".local").join("state").join("ratune")
+    } else {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "HOME not set"));
+    };
+    let dir = base.join("playlists");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

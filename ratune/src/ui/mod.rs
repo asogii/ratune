@@ -11,6 +11,7 @@ pub mod now_playing;
 pub mod now_playing_format;
 pub mod nowplaying_tab;
 pub mod playlist_overlay;
+pub mod playlists_tab;
 pub mod popup;
 pub mod queue;
 pub mod status_bar;
@@ -69,6 +70,22 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         Tab::NowPlaying => {
             let areas = layout::build_layout(frame.area(), &layout::layout_options_for_app(app));
             nowplaying_tab::render(app, frame, areas.center);
+            now_playing::render(app, frame, areas.now_playing);
+            status_bar::render(app, frame, areas.status_bar);
+            // Tab bar (skip if terminal is too small).
+            if total_rows >= 20 {
+                tab_bar::render_tab_bar(
+                    frame,
+                    areas.tab_bar,
+                    app.active_tab,
+                    app.accent(),
+                    &app.theme,
+                );
+            }
+        }
+        Tab::Playlists => {
+            let areas = layout::build_layout(frame.area(), &layout::layout_options_for_app(app));
+            playlists_tab::render(frame, areas.center, app);
             now_playing::render(app, frame, areas.now_playing);
             status_bar::render(app, frame, areas.status_bar);
             // Tab bar (skip if terminal is too small).

@@ -28,8 +28,8 @@ use crate::models::{
     parse_music_library_root_folder_id, Album, AlbumEnvelope, Artist, ArtistEnvelope, Artists,
     ArtistsEnvelope, DirectoryChild, IndexesEnvelope, MusicDirectory, MusicDirectoryEnvelope,
     MusicFolder, MusicFoldersEnvelope, PingEnvelope, Playlist, PlaylistDetail, PlaylistEnvelope,
-    PlaylistsEnvelope, ScanStatus, ScanStatusEnvelope, SearchEnvelope, SearchResult3, Song,
-    SongEnvelope, SubsonicLibrary,
+    PlaylistsEnvelope, ScanStatus, ScanStatusEnvelope, SearchEnvelope,
+    SearchResult3, Song, SongEnvelope, SubsonicLibrary,
 };
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -595,6 +595,38 @@ impl SubsonicClient {
         check_status(&env.response.status, env.response.error.as_ref())
     }
 
+    /// Fetch starred (favorited) songs via `getStarred`.
+    pub async fn get_starred(&self) -> Result<Vec<Song>> {
+        let env: crate::models::StarredEnvelope = self
+            .http
+            .get(self.endpoint_url("getStarred"))
+            .query(&self.auth_params())
+            .send()
+            .await?
+            .json()
+            .await?;
+        let r = &env.response;
+        check_status(&r.status, r.error.as_ref())?;
+        Ok(r.starred.as_ref().map(|s| s.song.clone()).unwrap_or_default())
+    }
+
+    /// Fetch a random set of songs via `getRandomSongs`.
+    pub async fn get_random_songs(&self, count: u32) -> Result<Vec<Song>> {
+        let mut params = self.auth_params();
+        params.push(("size", count.to_string()));
+        let env: crate::models::RandomSongsEnvelope = self
+            .http
+            .get(self.endpoint_url("getRandomSongs"))
+            .query(&params)
+            .send()
+            .await?
+            .json()
+            .await?;
+        let r = &env.response;
+        check_status(&r.status, r.error.as_ref())?;
+        Ok(r.random_songs.as_ref().map(|s| s.song.clone()).unwrap_or_default())
+    }
+
     /// Mark a song as played (scrobble).
     pub async fn scrobble(&self, id: &str) -> Result<()> {
         let mut params = self.auth_params();
@@ -603,6 +635,36 @@ impl SubsonicClient {
         let env: PingEnvelope = self
             .http
             .get(self.endpoint_url("scrobble"))
+            .query(&params)
+            .send()
+            .await?
+            .json()
+            .await?;
+        check_status(&env.response.status, env.response.error.as_ref())
+    }
+
+    /// Star (favorite) a song.
+    pub async fn star_song(&self, id: &str) -> Result<()> {
+        let mut params = self.auth_params();
+        params.push(("id", id.to_string()));
+        let env: PingEnvelope = self
+            .http
+            .get(self.endpoint_url("star"))
+            .query(&params)
+            .send()
+            .await?
+            .json()
+            .await?;
+        check_status(&env.response.status, env.response.error.as_ref())
+    }
+
+    /// Unstar (unfavorite) a song.
+    pub async fn unstar_song(&self, id: &str) -> Result<()> {
+        let mut params = self.auth_params();
+        params.push(("id", id.to_string()));
+        let env: PingEnvelope = self
+            .http
+            .get(self.endpoint_url("unstar"))
             .query(&params)
             .send()
             .await?

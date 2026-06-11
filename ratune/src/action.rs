@@ -27,6 +27,36 @@ pub enum Action {
     ToggleBrowserFolder,
     /// Jump directly to NowPlaying tab (key '3')
     GoToNowPlaying,
+    /// Jump directly to Playlists tab (key '4')
+    GoToPlaylists,
+    /// Playlists tab: scroll in left (list) panel
+    PlaylistsScrollList,
+    /// Playlists tab: scroll in right (tracks) panel
+    PlaylistsScrollTracks,
+    /// Playlists tab: append selected tracks to queue
+    PlaylistsAddToQueue,
+    /// Playlists tab: replace queue and play selected tracks
+    PlaylistsPlayAll,
+    /// Playlists tab: start text input for saving queue
+    PlaylistsSaveQueue,
+    /// Queue reorder: move current track up (Ctrl+Up)
+    QueueMoveUp,
+    /// Queue reorder: move current track down (Ctrl+Down)
+    QueueMoveDown,
+    /// Playlists tab: append selected tracks to queue
+    PlaylistsAppend,
+    /// Playlists tab: prepend selected tracks to queue
+    PlaylistsPrepend,
+    /// Playlists tab: insert selected track after current playing
+    PlaylistsInsertNext,
+    /// Playlists tab: toggle count (Favorites/Random)
+    PlaylistsToggleCount,
+    /// Playlists tab: re-fetch random songs
+    PlaylistsReRandom,
+    /// Toggle repeat mode (none → one → all → none)
+    ToggleRepeatMode,
+    /// Toggle favorite (star) for current song
+    ToggleFavorite,
     FocusLeft,
     FocusRight,
     AddToQueue,
@@ -83,16 +113,6 @@ pub enum Action {
     HomeAlbumPlay,
     /// Append the selected album (strip) to queue without clearing.
     HomeAlbumAddToQueue,
-    /// Home tab: append current selection (track/album/artist) to queue.
-    HomeAddToQueue,
-    /// Home tab: append ALL items in current section to queue.
-    HomeAddAllToQueue,
-    /// Home tab: replace queue with ALL items in current section.
-    HomeReplaceAll,
-    /// Home tab: prepend current selection to queue.
-    HomePrependToQueue,
-    /// Home tab: prepend ALL items in current section to queue.
-    HomePrependAll,
     /// Toggle the playlist browser overlay.
     TogglePlaylistOverlay,
     /// Scroll up within the playlist overlay (list or tracks pane).

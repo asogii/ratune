@@ -1,5 +1,5 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
@@ -524,16 +524,34 @@ fn render_controls_widget(app: &App, frame: &mut Frame, area: Rect) {
     };
 
     let sep = Style::default().fg(t.dimmed);
+    let is_fav = app.playback.current_song.as_ref().and_then(|s| s.starred.as_ref()).is_some();
+    let fav_style = if is_fav {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        sep
+    };
+    let repeat_label = match app.playback.repeat_mode {
+        crate::state::RepeatMode::None => "↻",
+        crate::state::RepeatMode::All => "↻+",
+        crate::state::RepeatMode::One => "↺1",
+    };
+    let repeat_style = if app.playback.repeat_mode == crate::state::RepeatMode::None {
+        sep
+    } else {
+        Style::default().fg(app.accent()).add_modifier(Modifier::BOLD)
+    };
     let controls = Line::from(vec![
         Span::styled("⇄", sep),
-        Span::raw("      "),
+        Span::raw("  "),
         Span::styled("⏮", sep),
-        Span::raw("      "),
+        Span::raw("  "),
         Span::styled(play_label, play_style),
-        Span::raw("      "),
+        Span::raw("  "),
         Span::styled("⏭", sep),
-        Span::raw("      "),
-        Span::styled("↻", sep),
+        Span::raw("  "),
+        Span::styled(repeat_label, repeat_style),
+        Span::raw("  "),
+        Span::styled("♡", fav_style),
     ]);
 
     if area.height <= 1 {

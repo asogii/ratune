@@ -105,6 +105,11 @@ pub async fn run() -> Result<()> {
         eprintln!("warn: could not restore state: {e}");
     }
 
+    // Always start at Home tab regardless of saved state.
+    app.active_tab = Tab::Home;
+    // Pre-load playlists data so it's ready when navigated to.
+    app.refresh_playlists_tab();
+
     // Load play history.
     let history_path = history::history_path();
     match history::PlayHistory::load(&history_path) {
@@ -195,7 +200,7 @@ pub async fn run() -> Result<()> {
 
         match ratatui_image::picker::Picker::from_query_stdio() {
             Ok(mut p) => {
-                p.set_background_color(theme::surface_pad_rgba(app.theme.surface));
+                p.set_background_color(theme::color_to_rgba(app.theme.surface));
                 app.cell_px = Some(p.font_size());
                 app.art_picker = Some(p);
             }
@@ -741,6 +746,10 @@ async fn run_loop(
                                                 }
                                             }
                                         }
+                                    } else if app.active_tab == Tab::Playlists
+                                        && app.playlists_tab.save_input.is_some()
+                                    {
+                                        handle_playlists_save_input(key.code, key.modifiers, app)
                                     } else {
                                         map_key(
                                             key.code,
@@ -1226,6 +1235,28 @@ fn map_picker_key(code: KeyCode, _modifiers: KeyModifiers) -> Action {
     }
 }
 
+/// Handle keyboard input while Playlists tab save-input is active.
+fn handle_playlists_save_input(code: KeyCode, _modifiers: KeyModifiers, app: &mut App) -> Action {
+    if let Some(ref mut input) = app.playlists_tab.save_input {
+        if code == KeyCode::Enter {
+            return Action::PlaylistsSaveQueue;
+        }
+        if code == KeyCode::Esc {
+            app.playlists_tab.save_input = None;
+            return Action::None;
+        }
+        if code == KeyCode::Backspace {
+            input.pop();
+            return Action::None;
+        }
+        if let KeyCode::Char(c) = code {
+            input.push(c);
+            return Action::None;
+        }
+    }
+    Action::None
+}
+
 fn map_key(
     code: KeyCode,
     modifiers: KeyModifiers,
@@ -1279,27 +1310,42 @@ fn map_key(
                 return Action::HomeAlbumPlay;
             }
         }
-        // Home: queue operations (a/A/R/p/P) — work across all sections (RecentAlbums, RecentTracks, Rediscover).
-        if kb.home_add_to_queue.matches(code, modifiers) {
-            return Action::HomeAddToQueue;
-        }
-        if kb.home_add_all_to_queue.matches(code, modifiers) {
-            return Action::HomeAddAllToQueue;
-        }
-        if kb.home_replace_all.matches(code, modifiers) {
-            return Action::HomeReplaceAll;
-        }
-        if kb.home_prepend_to_queue.matches(code, modifiers) {
-            return Action::HomePrependToQueue;
-        }
-        if kb.home_prepend_all.matches(code, modifiers) {
-            return Action::HomePrependAll;
-        }
         if kb.column_left.matches(code, modifiers) {
             return Action::HomeAlbumLeft;
         }
         if kb.column_right.matches(code, modifiers) {
             return Action::HomeAlbumRight;
+        }
+        if kb.add_track.matches(code, modifiers) {
+            return Action::HomeAlbumAddToQueue;
+        }
+    }
+
+    // ── Playlists-tab-specific keybindings ────────────────────────────────────
+    if active_tab == Tab::Playlists {
+        // a: append to queue (right panel track)
+        if code == KeyCode::Char('a') && modifiers.is_empty() {
+            return Action::PlaylistsAppend;
+        }
+        // p: prepend to queue
+        if code == KeyCode::Char('p') && modifiers.is_empty() {
+            return Action::PlaylistsPrepend;
+        }
+        // i: insert next
+        if code == KeyCode::Char('i') && modifiers.is_empty() {
+            return Action::PlaylistsInsertNext;
+        }
+        // e: toggle count
+        if code == KeyCode::Char('e') && modifiers.is_empty() {
+            return Action::PlaylistsToggleCount;
+        }
+        // s: save queue
+        if code == KeyCode::Char('s') && modifiers.is_empty() {
+            return Action::PlaylistsSaveQueue;
+        }
+        // r: re-random (refresh random playlist)
+        if code == KeyCode::Char('r') && modifiers.is_empty() {
+            return Action::PlaylistsReRandom;
         }
     }
 
@@ -1343,15 +1389,20 @@ fn map_key(
     {
         return Action::ToggleVisualizer;
     }
-    // Up/Down arrows are always secondary scroll aliases
-    if code == KeyCode::Up {
+    // Up/Down arrows are always secondary scroll aliases.
+    // Check these AFTER tab-specific keys (queue_move_up/down for NowPlaying tab).
+    if code == KeyCode::Up
+        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
         return Action::Navigate(Direction::Up);
     }
-    if code == KeyCode::Down {
+    if code == KeyCode::Down
+        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
         return Action::Navigate(Direction::Down);
     }
     // PageUp/PageDown and vim-style Ctrl+u / Ctrl+d: lists on these tabs.
-    if matches!(active_tab, Tab::Browser | Tab::Home | Tab::NowPlaying) {
+    if matches!(active_tab, Tab::Browser | Tab::Home | Tab::NowPlaying | Tab::Playlists) {
         let ctrl = modifiers.intersects(KeyModifiers::CONTROL)
             && !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
         if code == KeyCode::PageUp
@@ -1389,6 +1440,9 @@ fn map_key(
     if kb.go_to_nowplaying.matches(code, modifiers) {
         return Action::GoToNowPlaying;
     }
+    if kb.go_to_playlists.matches(code, modifiers) {
+        return Action::GoToPlaylists;
+    }
     if let Some(spec) = &kb.toggle_folder_browse {
         if spec.matches(code, modifiers) {
             return Action::ToggleBrowserFolder;
@@ -1400,13 +1454,13 @@ fn map_key(
     if kb.seek_forward.matches(code, modifiers) {
         return match active_tab {
             Tab::NowPlaying => Action::SeekForward,
-            Tab::Browser | Tab::Home => Action::FocusRight,
+            Tab::Browser | Tab::Home | Tab::Playlists => Action::FocusRight,
         };
     }
     if kb.seek_backward.matches(code, modifiers) {
         return match active_tab {
             Tab::NowPlaying => Action::SeekBackward,
-            Tab::Browser | Tab::Home => Action::FocusLeft,
+            Tab::Browser | Tab::Home | Tab::Playlists => Action::FocusLeft,
         };
     }
 
@@ -1461,6 +1515,20 @@ fn map_key(
     }
     if kb.unshuffle.matches(code, modifiers) {
         return Action::Unshuffle;
+    }
+    if kb.toggle_repeat_mode.matches(code, modifiers) {
+        return Action::ToggleRepeatMode;
+    }
+    if kb.toggle_favorite.matches(code, modifiers) {
+        return Action::ToggleFavorite;
+    }
+    if (active_tab == Tab::NowPlaying || active_tab == Tab::Playlists)
+        && kb.queue_move_up.matches(code, modifiers) {
+        return Action::QueueMoveUp;
+    }
+    if (active_tab == Tab::NowPlaying || active_tab == Tab::Playlists)
+        && kb.queue_move_down.matches(code, modifiers) {
+        return Action::QueueMoveDown;
     }
     if kb.clear_queue.matches(code, modifiers) {
         return Action::ClearQueue;
@@ -1664,22 +1732,25 @@ fn handle_mouse_click(x: u16, y: u16, app: &mut App, terminal_size: ratatui::lay
     let center = areas.center;
     let now_playing = areas.now_playing;
 
-    // ── Tab bar: dispatch GoToHome / GoToBrowser / GoToNowPlaying ────────────
+    // ── Tab bar: dispatch GoToHome / GoToBrowser / GoToNowPlaying / GoToPlaylists ─
     if y == areas.tab_bar.y {
-        // The labels are:  " Home "  " │ "  " Browse "  " │ "  " Now Playing "
-        // Measure cumulative widths to decide which label was clicked.
-        // Label widths (chars): Home=6, sep=3, Browse=8, sep=3, NowPlaying=13
+        // Labels: " Home " (6) " │ " (3) " Browse " (8) " │ " (3) " Now Playing " (13)
+        //         " │ " (3) " Playlists " (11)
         let home_end: u16 = 6;
-        let browser_start: u16 = 9; // 6+3
-        let browser_end: u16 = 17; // 9+8
-        let np_start: u16 = 20; // 17+3
+        let browser_start: u16 = 9;   // 6+3
+        let browser_end: u16 = 17;    // 9+8
+        let np_start: u16 = 20;       // 17+3
+        let np_end: u16 = 33;         // 20+13
+        let pl_start: u16 = 36;       // 33+3
 
         let action = if x < home_end {
             Action::GoToHome
         } else if x >= browser_start && x < browser_end {
             Action::GoToBrowser
-        } else if x >= np_start {
+        } else if x >= np_start && x < np_end {
             Action::GoToNowPlaying
+        } else if x >= pl_start {
+            Action::GoToPlaylists
         } else {
             Action::None // clicked a separator
         };
@@ -1860,6 +1931,49 @@ fn handle_mouse_click(x: u16, y: u16, app: &mut App, terminal_size: ratatui::lay
                 }
             }
         }
+        Tab::Playlists => {
+            // Click in the left panel selects an item, right panel selects a track.
+            let left_inner = Rect {
+                x: center.x + 1,
+                y: center.y + 1,
+                width: center.width / 2 - 2,
+                height: center.height - 2,
+            };
+            if x >= left_inner.x && x < left_inner.x + left_inner.width
+                && y >= left_inner.y && y < left_inner.y + left_inner.height
+            {
+                let visible_row = (y - left_inner.y) as usize;
+                let non_header_indices: Vec<usize> = app.playlists_tab.items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| !matches!(item, crate::app::PlaylistItem::Header(_)))
+                    .map(|(i, _)| i)
+                    .collect();
+                if let Some(idx) = non_header_indices.get(visible_row).copied() {
+                    app.playlists_tab.selected = idx;
+                    app.playlists_tab.focus_left = true;
+                    app.dispatch(crate::action::Action::Select);
+                }
+            } else {
+                // Right panel click.
+                let right_inner = Rect {
+                    x: center.x + center.width / 2 + 1,
+                    y: center.y + 1,
+                    width: center.width / 2 - 2,
+                    height: center.height - 2,
+                };
+                if x >= right_inner.x && x < right_inner.x + right_inner.width
+                    && y >= right_inner.y && y < right_inner.y + right_inner.height
+                {
+                    let visible_row = (y - right_inner.y) as usize;
+                    if visible_row < app.playlists_tab.tracks.len() {
+                        app.playlists_tab.selected_track = visible_row;
+                        app.playlists_tab.focus_left = false;
+                        app.dispatch(crate::action::Action::Select);
+                    }
+                }
+            }
+        }
         Tab::NowPlaying => {
             let show_art = app.config.nowplaying_show_art;
             let boxed_np = app
@@ -1994,11 +2108,6 @@ fn handle_mouse_click(x: u16, y: u16, app: &mut App, terminal_size: ratatui::lay
     }
 }
 
-/// Query the tmux status bar position and return a row offset (0 or 1).
-///
-/// Returns 1 when the tmux status bar is enabled and positioned at the top,
-/// because the pane's row 0 maps to Ghostty's row 1 (the status bar occupies row 0).
-/// Returns 0 in all other cases (bottom bar, disabled, or not in tmux).
 fn tmux_status_offset() -> u16 {
     if std::env::var("TMUX").is_err() {
         return 0;

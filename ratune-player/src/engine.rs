@@ -10,64 +10,237 @@ use std::collections::VecDeque;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::num::NonZero;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::header::ACCEPT_ENCODING;
-use magnum::container::ogg::OpusSourceOgg;
+use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
+use symphonia::core::audio::{AudioBufferRef, SignalSpec};
+use symphonia::core::audio::SampleBuffer as SymphoniaSampleBuffer;
+use symphonia::core::codecs::CodecRegistry;
+use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::errors::Error;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
+use symphonia::core::io::{MediaSource, MediaSourceStream};
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+use symphonia::default::get_probe;
+use symphonia_adapter_libopus::OpusDecoder;
 use rodio::source::SeekError;
-use rodio::{ChannelCount, Decoder, DeviceSinkBuilder, Player, SampleRate, Source};
 
 use crate::tap::SampleTap;
 
 type SampleBuffer = Arc<Mutex<VecDeque<f32>>>;
 
-/// Adapts magnum's OpusSourceOgg to rodio 0.22's Source trait.
-///
-/// magnum's built-in `with_rodio` feature targets rodio 0.14 and is not
-/// compatible with the 0.22 version used elsewhere in this crate.
-struct MagnumOpusSource {
-    inner: OpusSourceOgg<Cursor<Vec<u8>>>,
+// ── Symphonia + libopus decoder (Opus Ogg) ──────────────────────────────────────
+
+/// Adapter that wraps a `Cursor<Vec<u8>>` as a `MediaSource` for symphonia.
+struct CursorMediaSource {
+    inner: Cursor<Vec<u8>>,
+    byte_len: u64,
 }
 
-impl Iterator for MagnumOpusSource {
+impl CursorMediaSource {
+    fn new(inner: Cursor<Vec<u8>>) -> Self {
+        let byte_len = inner.get_ref().len() as u64;
+        Self { inner, byte_len }
+    }
+}
+
+impl std::io::Read for CursorMediaSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Seek for CursorMediaSource {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl MediaSource for CursorMediaSource {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.byte_len)
+    }
+}
+
+/// Symphonia-based Opus decoder that implements rodio's `Source`.
+/// Uses `symphonia-adapter-libopus` for the actual Opus decoding.
+struct SymphoniaOpusSource {
+    decoder: Box<dyn symphonia::core::codecs::Decoder>,
+    format: Box<dyn FormatReader>,
+    buffer: SymphoniaSampleBuffer<f32>,
+    buffer_offset: usize,
+    spec: SignalSpec,
+    total_duration: Option<Duration>,
+}
+
+impl SymphoniaOpusSource {
+    fn new(bytes: Vec<u8>) -> Result<Self> {
+        let mss = MediaSourceStream::new(
+            Box::new(CursorMediaSource::new(Cursor::new(bytes))) as Box<dyn MediaSource>,
+            Default::default(),
+        );
+
+        // Build a custom codec registry with just the Opus decoder.
+        let mut codec_registry = CodecRegistry::new();
+        codec_registry.register_all::<OpusDecoder>();
+
+        let format_opts = FormatOptions::default();
+        let metadata_opts = MetadataOptions::default();
+        let hint = Hint::new();
+
+        let mut probed = get_probe()
+            .format(&hint, mss, &format_opts, &metadata_opts)
+            .map_err(|e| anyhow::anyhow!("symphonia probe failed: {e}"))?;
+
+        // Find the first track with a supported codec.
+        let track_id = probed
+            .format
+            .tracks()
+            .iter()
+            .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+            .ok_or_else(|| anyhow::anyhow!("Opus track not found"))?
+            .id;
+        let track = probed
+            .format
+            .tracks()
+            .iter()
+            .find(|t| t.id == track_id)
+            .ok_or_else(|| anyhow::anyhow!("Opus track not found"))?;
+
+        let mut decoder = codec_registry
+            .make(&track.codec_params, &DecoderOptions::default())
+            .map_err(|e| anyhow::anyhow!("Opus decoder init failed: {e}"))?;
+
+        let total_duration = track
+            .codec_params
+            .time_base
+            .zip(track.codec_params.n_frames)
+            .map(|(base, frames)| base.calc_time(frames).into())
+            .filter(|d: &Duration| !d.is_zero());
+
+        // Decode the first packet to get the signal spec.
+        let decoded = loop {
+            let packet = probed
+                .format
+                .next_packet()
+                .map_err(|e| anyhow::anyhow!("symphonia read error: {e}"))?;
+            if packet.track_id() != track_id {
+                continue;
+            }
+            match decoder.decode(&packet) {
+                Ok(decoded) => break decoded,
+                Err(Error::DecodeError(_)) => continue,
+                Err(e) => anyhow::bail!("Opus decode error: {e}"),
+            }
+        };
+
+        let spec = decoded.spec().to_owned();
+        let buf = Self::sample_buffer(decoded, &spec);
+
+        Ok(Self {
+            decoder,
+            format: probed.format,
+            buffer: buf,
+            buffer_offset: 0,
+            spec,
+            total_duration,
+        })
+    }
+
+    fn sample_buffer(decoded: AudioBufferRef, spec: &SignalSpec) -> SymphoniaSampleBuffer<f32> {
+        let duration = symphonia::core::units::Duration::from(decoded.capacity() as u64);
+        let mut buffer = SymphoniaSampleBuffer::<f32>::new(duration, *spec);
+        buffer.copy_interleaved_ref(decoded);
+        buffer
+    }
+
+    fn decode_next(&mut self) -> Option<()> {
+        loop {
+            let packet = self.format.next_packet().ok()?;
+            if packet.track_id() != self.format.tracks().first()?.id {
+                continue;
+            }
+            match self.decoder.decode(&packet) {
+                Ok(decoded) => {
+                    if decoded.frames() == 0 {
+                        continue;
+                    }
+                    decoded.spec().clone_into(&mut self.spec);
+                    self.buffer = Self::sample_buffer(decoded, &self.spec);
+                    self.buffer_offset = 0;
+                    return Some(());
+                }
+                Err(Error::DecodeError(_)) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+impl Iterator for SymphoniaOpusSource {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
-        self.inner.next()
+        if self.buffer_offset >= self.buffer.samples().len() {
+            self.decode_next()?;
+        }
+        let sample = *self.buffer.samples().get(self.buffer_offset)?;
+        self.buffer_offset += 1;
+        Some(sample)
     }
 }
 
-impl Source for MagnumOpusSource {
+impl Source for SymphoniaOpusSource {
     fn current_span_len(&self) -> Option<usize> {
-        Some(240) // Opus: 120 samples/channel × 2 channels
+        Some(self.buffer.samples().len().saturating_sub(self.buffer_offset))
     }
 
-    fn channels(&self) -> ChannelCount {
-        NonZero::new(self.inner.metadata.channel_count.into()).unwrap()
+    fn channels(&self) -> rodio::ChannelCount {
+        rodio::ChannelCount::new(
+            self.spec.channels.count() as u16,
+        )
+        .expect("at least one channel")
     }
 
-    fn sample_rate(&self) -> SampleRate {
-        NonZero::new(48_000u32).unwrap() // Opus always decodes at 48 kHz
+    fn sample_rate(&self) -> rodio::SampleRate {
+        rodio::SampleRate::new(self.spec.rate).expect("non-zero sample rate")
     }
 
     fn total_duration(&self) -> Option<Duration> {
-        None // magnum does not calculate total duration
+        self.total_duration
     }
 
-    fn try_seek(&mut self, _pos: Duration) -> Result<(), SeekError> {
-        Err(SeekError::NotSupported {
-            underlying_source: "magnum OpusSourceOgg",
-        })
+    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+        // Use coarse seek via symphonia demuxer, then reset decoder.
+        let seek_to = SeekTo::Time {
+            time: pos.into(),
+            track_id: None,
+        };
+        match self.format.seek(SeekMode::Coarse, seek_to) {
+            Ok(_) => {
+                self.decoder.reset();
+                self.buffer_offset = usize::MAX; // force re-decode on next next()
+                Ok(())
+            }
+            Err(_) => Err(SeekError::NotSupported {
+                underlying_source: "SymphoniaOpusSource",
+            }),
+        }
     }
 }
 
-/// Unified source type: Symphonia for most formats, magnum for Opus Ogg.
+/// Unified source type: Symphonia's rodio Decoder for most formats,
+/// custom symphonia-opus for Opus Ogg.
 enum DecodedSource {
     Symphonia(Decoder<Cursor<Vec<u8>>>),
-    MagnumOpus(MagnumOpusSource),
+    Opus(SymphoniaOpusSource),
 }
 
 impl Iterator for DecodedSource {
@@ -75,7 +248,7 @@ impl Iterator for DecodedSource {
     fn next(&mut self) -> Option<f32> {
         match self {
             Self::Symphonia(d) => d.next(),
-            Self::MagnumOpus(d) => d.next(),
+            Self::Opus(d) => d.next(),
         }
     }
 }
@@ -84,35 +257,35 @@ impl Source for DecodedSource {
     fn current_span_len(&self) -> Option<usize> {
         match self {
             Self::Symphonia(d) => d.current_span_len(),
-            Self::MagnumOpus(d) => d.current_span_len(),
+            Self::Opus(d) => d.current_span_len(),
         }
     }
 
-    fn channels(&self) -> ChannelCount {
+    fn channels(&self) -> rodio::ChannelCount {
         match self {
             Self::Symphonia(d) => d.channels(),
-            Self::MagnumOpus(d) => d.channels(),
+            Self::Opus(d) => d.channels(),
         }
     }
 
-    fn sample_rate(&self) -> SampleRate {
+    fn sample_rate(&self) -> rodio::SampleRate {
         match self {
             Self::Symphonia(d) => d.sample_rate(),
-            Self::MagnumOpus(d) => d.sample_rate(),
+            Self::Opus(d) => d.sample_rate(),
         }
     }
 
     fn total_duration(&self) -> Option<Duration> {
         match self {
             Self::Symphonia(d) => d.total_duration(),
-            Self::MagnumOpus(d) => d.total_duration(),
+            Self::Opus(d) => d.total_duration(),
         }
     }
 
     fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
         match self {
             Self::Symphonia(d) => d.try_seek(pos),
-            Self::MagnumOpus(d) => d.try_seek(pos),
+            Self::Opus(d) => d.try_seek(pos),
         }
     }
 }
@@ -621,13 +794,12 @@ fn build_decoder(bytes: Vec<u8>) -> Result<DecodedSource> {
         && bytes.windows(8).any(|w| w == b"OpusHead");
 
     if is_opus {
-        let cursor = Cursor::new(bytes);
-        let source = OpusSourceOgg::new(cursor)
-            .context("decoding Opus audio with magnum")?;
-        return Ok(DecodedSource::MagnumOpus(MagnumOpusSource { inner: source }));
+        let source = SymphoniaOpusSource::new(bytes)
+            .context("decoding Opus audio with symphonia + libopus")?;
+        return Ok(DecodedSource::Opus(source));
     }
 
-    // Fall back to Symphonia for all other formats (MP3, FLAC, Vorbis, AAC, etc.).
+    // Fall back to rodio::Decoder (Symphonia) for all other formats (MP3, FLAC, Vorbis, AAC, etc.).
     let byte_len = bytes.len() as u64;
     let cursor = Cursor::new(bytes);
     Decoder::builder()

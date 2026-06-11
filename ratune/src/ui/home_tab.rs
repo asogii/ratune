@@ -277,6 +277,8 @@ fn render_home_panel(
                     // Kitty strip images are drawn after `terminal.draw` in main.rs.
                     render_art_strip_labels(f, albums_inner, &app.home, accent, cell_px, is_active);
                 } else if app.ratatui_art_ready() {
+                    // Render images first, then labels on top so CJK text is always
+                    // composited above the Sixel layer (prevents flickering on foot).
                     render_art_strip_ratatui(f, albums_inner, app, is_active);
                     render_art_strip_labels(f, albums_inner, &app.home, accent, cell_px, is_active);
                 }
@@ -353,7 +355,7 @@ fn render_recent_albums_list(
 
 fn render_art_strip_ratatui(f: &mut Frame, albums_inner: Rect, app: &mut App, _is_active: bool) {
     if let Some(p) = app.art_picker.as_mut() {
-        p.set_background_color(crate::theme::surface_pad_rgba(app.theme.surface));
+        p.set_background_color(crate::theme::color_to_rgba(app.theme.surface));
     }
     let Some(picker) = app.art_picker.as_ref() else {
         return;
@@ -368,7 +370,7 @@ fn render_art_strip_ratatui(f: &mut Frame, albums_inner: Rect, app: &mut App, _i
 
     let is_sixel = matches!(picker.protocol_type(), ProtocolType::Sixel);
     let img_resize = app.ratatui_stateful_resize_strip();
-    const MAX_SIXEL_STRIP_BUILDS_PER_FRAME: usize = 3;
+    const MAX_SIXEL_STRIP_BUILDS_PER_FRAME: usize = 12;
     let mut sixel_builds_this_frame = 0usize;
     let mut keep = HashSet::new();
     let fs = picker.font_size();

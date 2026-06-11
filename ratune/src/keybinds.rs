@@ -160,6 +160,8 @@ pub struct Keybinds {
     pub go_to_browser: KeySpec,
     /// Jump to NowPlaying tab (default: '3')
     pub go_to_nowplaying: KeySpec,
+    /// Jump to Playlists tab (default: '4')
+    pub go_to_playlists: KeySpec,
     pub quit: KeySpec,
     /// Fuzzy library picker (`None` = disabled).
     pub library_fzf: Option<KeySpec>,
@@ -178,19 +180,19 @@ pub struct Keybinds {
     pub browser_add_to_playlist: KeySpec,
     /// Playlist overlay (tracks pane): remove highlighted track (`<`).
     pub remove_from_playlist: KeySpec,
+    /// Queue: move track up.
+    pub queue_move_up: KeySpec,
+    /// Queue: move track down.
+    pub queue_move_down: KeySpec,
+    /// Playlists tab: toggle count.
+    pub playlists_toggle_count: KeySpec,
+    /// Toggle repeat mode.
+    pub toggle_repeat_mode: KeySpec,
+    /// Toggle favorite.
+    pub toggle_favorite: KeySpec,
     pub home_section_next: KeySpec,
     pub home_section_prev: KeySpec,
     pub home_refresh: KeySpec,
-    /// Home: append current selection to queue.
-    pub home_add_to_queue: KeySpec,
-    /// Home: append ALL items in current section to queue.
-    pub home_add_all_to_queue: KeySpec,
-    /// Home: replace queue with ALL items in current section.
-    pub home_replace_all: KeySpec,
-    /// Home: prepend current selection to queue.
-    pub home_prepend_to_queue: KeySpec,
-    /// Home: prepend ALL items in current section to queue.
-    pub home_prepend_all: KeySpec,
     /// `None` = disabled — folder toggle from keybinds
     pub toggle_folder_browse: Option<KeySpec>,
 }
@@ -344,6 +346,10 @@ impl Keybinds {
                 sec.go_to_nowplaying.as_deref(),
                 KeySpec::new(KeyCode::Char('3')),
             ),
+            go_to_playlists: resolve(
+                sec.go_to_playlists.as_deref(),
+                KeySpec::new(KeyCode::Char('4')),
+            ),
             quit: resolve(sec.quit.as_deref(), KeySpec::new(KeyCode::Char('q'))),
             library_fzf,
             library_refresh,
@@ -382,6 +388,32 @@ impl Keybinds {
                 sec.remove_from_playlist.as_deref(),
                 KeySpec::new(KeyCode::Char('<')),
             ),
+            queue_move_up: resolve(
+                sec.queue_move_up.as_deref(),
+                KeySpec {
+                    code: KeyCode::Up,
+                    modifiers: KeyModifiers::CONTROL,
+                },
+            ),
+            queue_move_down: resolve(
+                sec.queue_move_down.as_deref(),
+                KeySpec {
+                    code: KeyCode::Down,
+                    modifiers: KeyModifiers::CONTROL,
+                },
+            ),
+            playlists_toggle_count: resolve(
+                sec.playlists_toggle_count.as_deref(),
+                KeySpec::new(KeyCode::Char('e')),
+            ),
+            toggle_repeat_mode: resolve(
+                sec.toggle_repeat_mode.as_deref(),
+                KeySpec::new(KeyCode::Char('r')),
+            ),
+            toggle_favorite: resolve(
+                sec.toggle_favorite.as_deref(),
+                KeySpec::new(KeyCode::Char('f')),
+            ),
             home_section_next: resolve(
                 sec.home_section_next.as_deref(),
                 KeySpec {
@@ -399,35 +431,6 @@ impl Keybinds {
             home_refresh: resolve(
                 sec.home_refresh.as_deref(),
                 KeySpec::new(KeyCode::Char('r')),
-            ),
-            home_add_to_queue: resolve(
-                sec.home_add_to_queue.as_deref(),
-                KeySpec::new(KeyCode::Char('a')),
-            ),
-            home_add_all_to_queue: resolve(
-                sec.home_add_all_to_queue.as_deref(),
-                KeySpec {
-                    code: KeyCode::Char('a'),
-                    modifiers: KeyModifiers::SHIFT,
-                },
-            ),
-            home_replace_all: resolve(
-                sec.home_replace_all.as_deref(),
-                KeySpec {
-                    code: KeyCode::Char('r'),
-                    modifiers: KeyModifiers::SHIFT,
-                },
-            ),
-            home_prepend_to_queue: resolve(
-                sec.home_prepend_to_queue.as_deref(),
-                KeySpec::new(KeyCode::Char('p')),
-            ),
-            home_prepend_all: resolve(
-                sec.home_prepend_all.as_deref(),
-                KeySpec {
-                    code: KeyCode::Char('p'),
-                    modifiers: KeyModifiers::SHIFT,
-                },
             ),
             toggle_folder_browse,
         }

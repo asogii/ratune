@@ -20,6 +20,7 @@ pub fn render_tab_bar(f: &mut Frame, area: Rect, active_tab: Tab, accent: Color,
     let label_home = " Home ";
     let label_browser = " Browse ";
     let label_nowplaying = " Now Playing ";
+    let label_playlists = " Playlists ";
 
     let span_home = if active_tab == Tab::Home {
         Span::styled(
@@ -57,12 +58,26 @@ pub fn render_tab_bar(f: &mut Frame, area: Rect, active_tab: Tab, accent: Color,
         Span::styled(label_nowplaying, Style::default().fg(theme.dimmed))
     };
 
+    let span_playlists = if active_tab == Tab::Playlists {
+        Span::styled(
+            label_playlists,
+            Style::default()
+                .bg(accent)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(label_playlists, Style::default().fg(theme.dimmed))
+    };
+
     let line = Line::from(vec![
         span_home,
         separator.clone(),
         span_browser,
-        separator,
+        separator.clone(),
         span_nowplaying,
+        separator,
+        span_playlists,
     ]);
 
     let para = Paragraph::new(line).style(style_with_bg(theme.tab_bar));
