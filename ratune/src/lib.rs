@@ -44,7 +44,7 @@ use action::{Action, Direction};
 use app::{App, BrowserColumn, Tab};
 use config::{AlbumArtBackend, BrowseMode, Config, HomePanel};
 use keybinds::Keybinds;
-use state::{GlobalConfirm, PlaylistFocus, PlaylistInputMode};
+use state::GlobalConfirm;
 
 /// Entry point shared by the `ratune` binary and integration tests.
 pub async fn run() -> Result<()> {
@@ -669,57 +669,7 @@ async fn run_loop(
                             // Only process key-press events; ignore release/repeat to avoid
                             // double-firing on terminals that send all event kinds (e.g. Kitty).
                             if key.kind == KeyEventKind::Press => {
-                                if app.playlist_picker.is_some() && !app.help_visible {
-                                    // Picker is open: highest priority — swallow all keys.
-                                    let action = map_picker_key(key.code, key.modifiers);
-                                    app.dispatch(action);
-                                } else if app.playlist_overlay.visible
-                                    && app.active_tab == Tab::Browser
-                                    && !app.help_visible
-                                {
-                                    // Tab-switch keys close the overlay and switch tabs.
-                                    let is_tab_switch = matches!(
-                                        key.code,
-                                        KeyCode::Tab
-                                            | KeyCode::BackTab
-                                            | KeyCode::Char('1')
-                                            | KeyCode::Char('2')
-                                            | KeyCode::Char('3')
-                                    );
-                                    // Quit key in Normal mode closes the overlay only;
-                                    // the user must press q again (overlay closed) to quit.
-                                    // In text-input modes q is a typed character — don't intercept.
-                                    let is_quit_in_normal =
-                                        app.keybinds.quit.matches(key.code, key.modifiers)
-                                            && matches!(
-                                                app.playlist_overlay.input_mode,
-                                                PlaylistInputMode::Normal
-                                            );
-                                    if is_tab_switch {
-                                        app.playlist_overlay.visible = false;
-                                        let action = keymap::map_key(
-                                            key.code,
-                                            key.modifiers,
-                                            app.active_tab,
-                                            &app.keybinds,
-                                            &mut app.pending_gg,
-                                        );
-                                        app.dispatch(action);
-                                    } else if is_quit_in_normal {
-                                        // Close overlay; do NOT quit.
-                                        app.playlist_overlay.visible = false;
-                                    } else {
-                                        let action = map_playlist_key(
-                                            key.code,
-                                            key.modifiers,
-                                            &app.playlist_overlay.focus,
-                                            &app.playlist_overlay.input_mode,
-                                            &app.keybinds,
-                                        );
-                                        app.dispatch(action);
-                                    }
-                                } else {
-                                    let action = if app.help_visible {
+                                let action = if app.help_visible {
                                         map_help_key(key.code, key.modifiers, &app.keybinds)
                                     } else if app.search_mode.active {
                                         map_search_key(key.code, key.modifiers)
@@ -801,7 +751,6 @@ async fn run_loop(
                                         other => app.dispatch(other),
                                     }
                                 }
-                            }
                         Event::Mouse(mouse) => {
                             let sz = terminal.size()?;
                             let area = Rect::new(0, 0, sz.width, sz.height);
@@ -1193,85 +1142,6 @@ fn home_click_panel(x: u16, y: u16, area: Rect, panel: HomePanel, app: &mut App)
                 }
             }
         }
-    }
-}
-
-/// Translate a key event into an `Action` when the playlist overlay is open.
-///
-/// Called instead of `map_key` whenever `playlist_overlay.visible` is true and
-/// the active tab is Browser.  Every key that is not handled here produces
-/// `Action::None`, so normal playback/volume keys are intentionally blocked
-/// while the overlay is in the foreground.
-fn map_playlist_key(
-    code: KeyCode,
-    modifiers: KeyModifiers,
-    focus: &PlaylistFocus,
-    input_mode: &PlaylistInputMode,
-    kb: &Keybinds,
-) -> Action {
-    match input_mode {
-        // ── Text-input modes: feed characters into the buffer ──────────────
-        PlaylistInputMode::Creating { .. } | PlaylistInputMode::Renaming { .. } => match code {
-            KeyCode::Esc => Action::PlaylistInputCancel,
-            KeyCode::Enter => Action::PlaylistInputConfirm,
-            KeyCode::Backspace => Action::PlaylistInputChar('\x08'),
-            KeyCode::Char(ch) => Action::PlaylistInputChar(ch),
-            _ => Action::None,
-        },
-        // ── Confirmation prompt: y/n ───────────────────────────────────────
-        PlaylistInputMode::Confirming { .. } => match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => Action::PlaylistConfirmYes,
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Action::PlaylistConfirmNo,
-            _ => Action::None,
-        },
-        // ── Normal navigation / mutation ───────────────────────────────────
-        PlaylistInputMode::Normal => {
-            let shift = modifiers.intersects(KeyModifiers::SHIFT);
-            match code {
-                KeyCode::Esc => Action::TogglePlaylistOverlay,
-                _ if kb.playlist_overlay.matches(code, modifiers) => Action::TogglePlaylistOverlay,
-                KeyCode::Char('k') | KeyCode::Up => Action::PlaylistScrollUp,
-                KeyCode::Char('j') | KeyCode::Down => Action::PlaylistScrollDown,
-                KeyCode::Char('h') => Action::PlaylistFocusList,
-                KeyCode::Char('l') => Action::PlaylistFocusTracks,
-                // c: create new playlist
-                KeyCode::Char('c') => Action::PlaylistCreate,
-                // r: rename selected playlist (list pane)
-                KeyCode::Char('r') => Action::PlaylistRename,
-                // X (Shift+x): delete selected playlist
-                KeyCode::Char('X') | KeyCode::Char('x') if code == KeyCode::Char('X') || shift => {
-                    Action::PlaylistDelete
-                }
-                _ if kb.remove_from_playlist.matches(code, modifiers)
-                    && matches!(focus, PlaylistFocus::Tracks) =>
-                {
-                    Action::PlaylistRemoveTrack
-                }
-                KeyCode::Enter => match focus {
-                    PlaylistFocus::List => Action::PlaylistPlayAll,
-                    PlaylistFocus::Tracks => Action::PlaylistPlayTrack,
-                },
-                // Shift+A — append all / append track
-                KeyCode::Char('A') | KeyCode::Char('a') if code == KeyCode::Char('A') || shift => {
-                    match focus {
-                        PlaylistFocus::List => Action::PlaylistAppendAll,
-                        PlaylistFocus::Tracks => Action::PlaylistAppendTrack,
-                    }
-                }
-                _ => Action::None,
-            }
-        }
-    }
-}
-
-/// Translate a key event into an `Action` when the playlist picker popup is open.
-fn map_picker_key(code: KeyCode, _modifiers: KeyModifiers) -> Action {
-    match code {
-        KeyCode::Esc => Action::PlaylistPickerCancel,
-        KeyCode::Enter => Action::PlaylistPickerSelect,
-        KeyCode::Char('k') | KeyCode::Up => Action::PlaylistPickerScrollUp,
-        KeyCode::Char('j') | KeyCode::Down => Action::PlaylistPickerScrollDown,
-        _ => Action::None,
     }
 }
 

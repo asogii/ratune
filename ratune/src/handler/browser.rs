@@ -5,6 +5,7 @@ use crate::action::Direction;
 use crate::state::LoadingState;
 use ratune_player::PlayerCommand;
 use std::time::Duration;
+use std::time::Duration;
 
 impl App {
     pub(crate) fn handle_focus_left(&mut self) {

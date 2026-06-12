@@ -342,63 +342,6 @@ pub enum GlobalConfirm {
     LibraryServerAppendQueue,
 }
 
-// ── PlaylistOverlay ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Default)]
-pub enum PlaylistFocus {
-    #[default]
-    List,
-    Tracks,
-}
-
-#[derive(Debug, Clone)]
-pub enum ConfirmAction {
-    DeletePlaylist { id: String, name: String },
-}
-
-#[derive(Debug, Clone, Default)]
-pub enum PlaylistInputMode {
-    #[default]
-    Normal,
-    Creating {
-        buffer: String,
-    },
-    Renaming {
-        buffer: String,
-        playlist_id: String,
-    },
-    Confirming {
-        action: ConfirmAction,
-    },
-}
-
-#[derive(Debug)]
-pub struct PlaylistOverlay {
-    pub visible: bool,
-    pub playlists: LoadingState<Vec<ratune_subsonic::Playlist>>,
-    pub selected_playlist_index: usize,
-    pub tracks: LoadingState<Vec<ratune_subsonic::Song>>,
-    pub selected_track_index: usize,
-    pub focus: PlaylistFocus,
-    pub loaded_playlist_id: Option<String>,
-    pub input_mode: PlaylistInputMode,
-}
-
-impl Default for PlaylistOverlay {
-    fn default() -> Self {
-        Self {
-            visible: false,
-            playlists: LoadingState::NotLoaded,
-            selected_playlist_index: 0,
-            tracks: LoadingState::NotLoaded,
-            selected_track_index: 0,
-            focus: PlaylistFocus::List,
-            loaded_playlist_id: None,
-            input_mode: PlaylistInputMode::Normal,
-        }
-    }
-}
-
 // ── PlaybackState ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default)]

@@ -21,9 +21,9 @@ use crate::config::{AlbumArtBackend, BrowseMode, Config};
 use crate::history::PlayRecord;
 use crate::keybinds::Keybinds;
 use crate::state::{
-    folder_left_default_row, folder_preview_rows, ConfirmAction, DirectoryListing,
+    folder_left_default_row, folder_preview_rows, DirectoryListing,
     FolderBrowseState, FolderPreviewRow, GlobalConfirm, LibraryState, LoadingState, PlaybackState,
-    PlaylistFocus, PlaylistInputMode, PlaylistOverlay, QueueState, RepeatMode,
+    QueueState,
 };
 use crate::theme::Theme;
 use image::{imageops::FilterType, DynamicImage};
@@ -369,37 +369,7 @@ pub enum LibraryUpdate {
     HomeArtFetchFailed {
         album_id: String,
     },
-    /// All playlists fetched from `getPlaylists`.
-    Playlists(Vec<ratune_subsonic::Playlist>),
-    /// Full track list for a single playlist fetched from `getPlaylist`.
-    PlaylistTracks {
-        playlist_id: String,
-        songs: Vec<ratune_subsonic::Song>,
-    },
-    /// A new playlist was successfully created.
-    PlaylistCreated(ratune_subsonic::Playlist),
-    /// A playlist was successfully deleted (carries the deleted ID).
-    PlaylistDeleted(String),
-    /// A playlist was successfully renamed.
-    PlaylistRenamed {
-        id: String,
-        new_name: String,
-    },
-    /// A track was successfully added to a playlist.
-    PlaylistTrackAdded {
-        _playlist_id: String,
-        playlist_name: String,
-    },
-    /// A track was successfully removed from a playlist.
-    PlaylistTrackRemoved {
-        _playlist_id: String,
-        index: usize,
-    },
-    /// Playlist list fetched for the picker (separate from the overlay's list).
-    PlaylistsForPicker(Vec<ratune_subsonic::Playlist>),
     /// Full library metadata index finished refreshing (background task).
-    /// Tuple:
-    /// - Vec<Song>: fresh index contents
     /// - Option<String>: Navidrome `lastScan` token to persist when scan-skip is enabled.
     /// - bool: whether this refresh was explicitly forced by the user (e.g. Ctrl+g).
     LibraryIndexRefreshComplete {
@@ -436,19 +406,6 @@ pub(crate) enum AddAllMode {
 
 // ── PlaylistPicker ────────────────────────────────────────────────────────────
 
-/// Floating picker shown when the user wants to add a browser track to a
-/// playlist.  Populated lazily from `getPlaylists`.
-#[derive(Debug)]
-pub struct PlaylistPicker {
-    pub playlists: Vec<ratune_subsonic::Playlist>,
-    pub selected_index: usize,
-    /// The song ID to be added to whichever playlist the user selects.
-    pub song_id: String,
-    /// `true` while a `getPlaylists` fetch is in flight.
-    pub loading: bool,
-}
-
-// ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct App {
     pub active_tab: Tab,
@@ -590,10 +547,6 @@ pub struct App {
     /// name on the next render pass, then clear the field.
     pub pending_artist_select: Option<String>,
 
-    // ── Playlist overlay (Phase 8) ────────────────────────────────────────────
-    pub playlist_overlay: PlaylistOverlay,
-    /// Floating picker for "add track to playlist" (None when not open).
-    pub playlist_picker: Option<PlaylistPicker>,
     /// Transient status message shown in the status bar. Second element is when
     /// the message should be cleared (`Instant::now() >= deadline`).
     pub status_flash: Option<(String, Instant)>,
@@ -751,8 +704,6 @@ impl App {
             home_strip_layout_key: None,
             home: HomeState::default(),
             pending_artist_select: None,
-            playlist_overlay: PlaylistOverlay::default(),
-            playlist_picker: None,
             status_flash: None,
             queue_viewport_rows: 12,
             browser_list_viewport_rows: 12,
@@ -2199,76 +2150,6 @@ impl App {
                     }
                 }
             }
-            LibraryUpdate::Playlists(playlists) => {
-                self.playlist_overlay.playlists = crate::state::LoadingState::Loaded(playlists);
-                self.playlist_overlay.selected_playlist_index = 0;
-            }
-            LibraryUpdate::PlaylistTracks { playlist_id, songs } => {
-                // Ignore stale results if the user navigated to a different playlist
-                // while this fetch was in flight.
-                if self.playlist_overlay.loaded_playlist_id.as_deref() == Some(&playlist_id) {
-                    self.playlist_overlay.tracks = LoadingState::Loaded(songs);
-                    self.playlist_overlay.selected_track_index = 0;
-                }
-            }
-            LibraryUpdate::PlaylistCreated(p) => {
-                // Append new playlist and select it.
-                match &mut self.playlist_overlay.playlists {
-                    LoadingState::Loaded(ref mut list) => {
-                        self.playlist_overlay.selected_playlist_index = list.len();
-                        list.push(p);
-                    }
-                    _ => {
-                        self.playlist_overlay.playlists = LoadingState::Loaded(vec![p]);
-                        self.playlist_overlay.selected_playlist_index = 0;
-                    }
-                }
-            }
-            LibraryUpdate::PlaylistDeleted(id) => {
-                if let LoadingState::Loaded(ref mut list) = self.playlist_overlay.playlists {
-                    list.retain(|p| p.id != id);
-                    let max = list.len().saturating_sub(1);
-                    self.playlist_overlay.selected_playlist_index =
-                        self.playlist_overlay.selected_playlist_index.min(max);
-                }
-                if self.playlist_overlay.loaded_playlist_id.as_deref() == Some(&id) {
-                    self.playlist_overlay.tracks = LoadingState::NotLoaded;
-                    self.playlist_overlay.loaded_playlist_id = None;
-                }
-            }
-            LibraryUpdate::PlaylistRenamed { id, new_name } => {
-                if let LoadingState::Loaded(ref mut list) = self.playlist_overlay.playlists {
-                    if let Some(p) = list.iter_mut().find(|p| p.id == id) {
-                        p.name = new_name;
-                    }
-                }
-            }
-            LibraryUpdate::PlaylistTrackAdded { playlist_name, .. } => {
-                self.status_flash = Some((
-                    format!("Added to {}", playlist_name),
-                    Instant::now() + Duration::from_secs(2),
-                ));
-            }
-            LibraryUpdate::PlaylistTrackRemoved {
-                _playlist_id: _,
-                index,
-            } => {
-                if let LoadingState::Loaded(ref mut songs) = self.playlist_overlay.tracks {
-                    if index < songs.len() {
-                        songs.remove(index);
-                    }
-                    let max = songs.len().saturating_sub(1);
-                    self.playlist_overlay.selected_track_index =
-                        self.playlist_overlay.selected_track_index.min(max);
-                }
-            }
-            LibraryUpdate::PlaylistsForPicker(playlists) => {
-                self.playlist_overlay.playlists = LoadingState::Loaded(playlists.clone());
-                if let Some(ref mut picker) = self.playlist_picker {
-                    picker.playlists = playlists;
-                    picker.loading = false;
-                }
-            }
             LibraryUpdate::MusicFolders(result) => {
                 self.folders.roots = match result {
                     Ok(roots) => {
@@ -3051,8 +2932,6 @@ impl App {
             Action::LibraryFzfPicker => {}
             Action::Quit => self.should_quit = true,
             Action::SwitchTab => {
-                self.playlist_overlay.visible = false;
-                self.playlist_picker = None;
                 self.clear_art_on_tab_switch();
                 self.active_tab = self.active_tab.next();
                 self.clear_browser_search();
@@ -3066,8 +2945,6 @@ impl App {
                 }
             }
             Action::SwitchTabReverse => {
-                self.playlist_overlay.visible = false;
-                self.playlist_picker = None;
                 self.clear_art_on_tab_switch();
                 self.active_tab = self.active_tab.prev();
                 self.clear_browser_search();
@@ -3081,8 +2958,6 @@ impl App {
                 }
             }
             Action::GoToHome => {
-                self.playlist_overlay.visible = false;
-                self.playlist_picker = None;
                 if self.kitty_apc_overlay_active() {
                     let _ = crate::ui::kitty_art::clear_image(self.in_tmux);
                 }
@@ -3092,16 +2967,12 @@ impl App {
                 self.home_art_needs_redraw = true;
             }
             Action::GoToBrowser => {
-                self.playlist_overlay.visible = false;
-                self.playlist_picker = None;
                 self.clear_art_on_tab_switch();
                 self.active_tab = Tab::Browser;
                 self.clear_browser_search();
                 self.apply_pending_artist_select();
             }
             Action::ToggleBrowserFolder => {
-                self.playlist_overlay.visible = false;
-                self.playlist_picker = None;
                 self.clear_art_on_tab_switch();
                 self.pending_gg = false;
                 if !self.config.browse_folder_navigation {
@@ -3140,15 +3011,11 @@ impl App {
                 }
             }
             Action::GoToNowPlaying => {
-                self.playlist_overlay.visible = false;
-                self.playlist_picker = None;
                 self.clear_art_on_tab_switch();
                 self.active_tab = Tab::NowPlaying;
                 self.clear_browser_search();
             }
             Action::GoToPlaylists => {
-                self.playlist_overlay.visible = false;
-                self.playlist_picker = None;
                 self.clear_art_on_tab_switch();
                 self.active_tab = Tab::Playlists;
                 self.clear_browser_search();
@@ -3559,33 +3426,6 @@ impl App {
                     self.accent_transition_start = Some(Instant::now());
                 }
             }
-            Action::TogglePlaylistOverlay
-            | Action::PlaylistScrollUp
-            | Action::PlaylistScrollDown
-            | Action::PlaylistFocusTracks
-            | Action::PlaylistFocusList
-            | Action::PlaylistPlayAll
-            | Action::PlaylistAppendAll
-            | Action::PlaylistPlayTrack
-            | Action::PlaylistAppendTrack => {
-                self.handle_playlist_action(action);
-            }
-            Action::PlaylistCreate
-            | Action::PlaylistDelete
-            | Action::PlaylistRename
-            | Action::PlaylistRemoveTrack
-            | Action::BrowserAddToPlaylist
-            | Action::PlaylistPickerSelect
-            | Action::PlaylistPickerCancel
-            | Action::PlaylistPickerScrollUp
-            | Action::PlaylistPickerScrollDown
-            | Action::PlaylistInputConfirm
-            | Action::PlaylistInputCancel
-            | Action::PlaylistInputChar(_)
-            | Action::PlaylistConfirmYes
-            | Action::PlaylistConfirmNo => {
-                self.handle_playlist_mutation(action);
-            }
             Action::PlaylistsScrollList | Action::PlaylistsScrollTracks => {}
             Action::QueueMoveUp => self.handle_queue_move_up(),
             Action::QueueMoveDown => self.handle_queue_move_down(),
@@ -3870,413 +3710,4 @@ impl App {
             .is_some_and(|deadline| Instant::now() < deadline)
     }
 
-    // ── Playlist overlay ──────────────────────────────────────────────────────
-
-    /// Spawn a background task to fetch all playlists from the server.
-    pub fn fetch_playlists(&self) {
-        let client = self.subsonic.clone();
-        let tx = self.library_tx.clone();
-        tokio::spawn(async move {
-            match client.get_playlists().await {
-                Ok(playlists) => {
-                    let _ = tx.send(LibraryUpdate::Playlists(playlists)).await;
-                }
-                Err(e) => eprintln!("ratune: get_playlists failed — {e}"),
-            }
-        });
-    }
-
-    /// Spawn a background task to fetch the track list for `playlist_id`.
-    pub fn fetch_playlist_tracks(&self, playlist_id: String) {
-        let client = self.subsonic.clone();
-        let tx = self.library_tx.clone();
-        tokio::spawn(async move {
-            match client.get_playlist(&playlist_id).await {
-                Ok(detail) => {
-                    let _ = tx
-                        .send(LibraryUpdate::PlaylistTracks {
-                            playlist_id,
-                            songs: detail.songs,
-                        })
-                        .await;
-                }
-                Err(e) => eprintln!("ratune: get_playlist({playlist_id}) failed — {e}"),
-            }
-        });
-    }
-
-    /// Handle an action directed at the playlist overlay.
-    ///
-    /// Called both from `dispatch()` (for `TogglePlaylistOverlay` when overlay is
-    /// closed) and directly from the event loop (for all keys when overlay is open).
-    pub fn handle_playlist_action(&mut self, action: Action) {
-        match action {
-            Action::TogglePlaylistOverlay => {
-                if self.playlist_overlay.visible {
-                    self.playlist_overlay.visible = false;
-                } else {
-                    self.playlist_overlay.visible = true;
-                    if matches!(self.playlist_overlay.playlists, LoadingState::NotLoaded) {
-                        self.playlist_overlay.playlists = LoadingState::Loading;
-                        self.fetch_playlists();
-                    }
-                }
-            }
-            Action::PlaylistScrollUp => match self.playlist_overlay.focus {
-                PlaylistFocus::List => {
-                    self.playlist_overlay.selected_playlist_index = self
-                        .playlist_overlay
-                        .selected_playlist_index
-                        .saturating_sub(1);
-                }
-                PlaylistFocus::Tracks => {
-                    self.playlist_overlay.selected_track_index =
-                        self.playlist_overlay.selected_track_index.saturating_sub(1);
-                }
-            },
-            Action::PlaylistScrollDown => match self.playlist_overlay.focus {
-                PlaylistFocus::List => {
-                    if let LoadingState::Loaded(ref playlists) = self.playlist_overlay.playlists {
-                        let max = playlists.len().saturating_sub(1);
-                        self.playlist_overlay.selected_playlist_index =
-                            (self.playlist_overlay.selected_playlist_index + 1).min(max);
-                    }
-                }
-                PlaylistFocus::Tracks => {
-                    if let LoadingState::Loaded(ref songs) = self.playlist_overlay.tracks {
-                        let max = songs.len().saturating_sub(1);
-                        self.playlist_overlay.selected_track_index =
-                            (self.playlist_overlay.selected_track_index + 1).min(max);
-                    }
-                }
-            },
-            Action::PlaylistFocusTracks => {
-                self.playlist_overlay.focus = PlaylistFocus::Tracks;
-                // Fetch tracks if not already loaded for the currently selected playlist.
-                if let LoadingState::Loaded(ref playlists) = self.playlist_overlay.playlists {
-                    if let Some(playlist) =
-                        playlists.get(self.playlist_overlay.selected_playlist_index)
-                    {
-                        let id = playlist.id.clone();
-                        if self.playlist_overlay.loaded_playlist_id.as_deref() != Some(&id) {
-                            self.playlist_overlay.tracks = LoadingState::Loading;
-                            self.playlist_overlay.loaded_playlist_id = Some(id.clone());
-                            self.fetch_playlist_tracks(id);
-                        }
-                    }
-                }
-            }
-            Action::PlaylistFocusList => {
-                self.playlist_overlay.focus = PlaylistFocus::List;
-            }
-            Action::PlaylistPlayAll => {
-                if let LoadingState::Loaded(ref songs) = self.playlist_overlay.tracks {
-                    let songs = songs.clone();
-                    self.queue.songs.clear();
-                    self.queue.cursor = 0;
-                    self.queue.scroll = 0;
-                    self.queue.pre_shuffle_order = None;
-                    for song in songs {
-                        self.queue.push(song);
-                    }
-                    if !self.queue.songs.is_empty() {
-                        self.queue.cursor = 0;
-                        self.queue.scroll = 0;
-                        self.play_current();
-                    }
-                }
-                self.playlist_overlay.visible = false;
-            }
-            Action::PlaylistAppendAll => {
-                if let LoadingState::Loaded(ref songs) = self.playlist_overlay.tracks {
-                    let was_empty = self.queue.songs.is_empty();
-                    for song in songs.clone() {
-                        self.queue.push(song);
-                    }
-                    if was_empty && !self.queue.songs.is_empty() {
-                        self.queue.cursor = 0;
-                        self.queue.scroll = 0;
-                        self.play_current();
-                    }
-                }
-                self.playlist_overlay.visible = false;
-            }
-            Action::PlaylistPlayTrack => {
-                if let LoadingState::Loaded(ref songs) = self.playlist_overlay.tracks {
-                    if let Some(song) = songs
-                        .get(self.playlist_overlay.selected_track_index)
-                        .cloned()
-                    {
-                        self.queue.songs.clear();
-                        self.queue.cursor = 0;
-                        self.queue.scroll = 0;
-                        self.queue.pre_shuffle_order = None;
-                        self.queue.push(song);
-                        self.queue.cursor = 0;
-                        self.queue.scroll = 0;
-                        self.play_current();
-                    }
-                }
-                self.playlist_overlay.visible = false;
-            }
-            Action::PlaylistAppendTrack => {
-                if let LoadingState::Loaded(ref songs) = self.playlist_overlay.tracks {
-                    if let Some(song) = songs
-                        .get(self.playlist_overlay.selected_track_index)
-                        .cloned()
-                    {
-                        let was_empty = self.queue.songs.is_empty();
-                        self.queue.push(song);
-                        if was_empty {
-                            self.queue.cursor = 0;
-                            self.queue.scroll = 0;
-                            self.play_current();
-                        }
-                    }
-                }
-                self.playlist_overlay.visible = false;
-            }
-            _ => {}
-        }
-    }
-
-    // ── Playlist mutation actions (Phase 8.2) ─────────────────────────────────
-
-    pub fn handle_playlist_mutation(&mut self, action: Action) {
-        match action {
-            Action::PlaylistCreate => {
-                self.playlist_overlay.input_mode = PlaylistInputMode::Creating {
-                    buffer: String::new(),
-                };
-            }
-            Action::PlaylistRename => {
-                if let LoadingState::Loaded(ref playlists) = self.playlist_overlay.playlists {
-                    if let Some(p) = playlists.get(self.playlist_overlay.selected_playlist_index) {
-                        self.playlist_overlay.input_mode = PlaylistInputMode::Renaming {
-                            buffer: p.name.clone(),
-                            playlist_id: p.id.clone(),
-                        };
-                    }
-                }
-            }
-            Action::PlaylistDelete => {
-                if let LoadingState::Loaded(ref playlists) = self.playlist_overlay.playlists {
-                    if let Some(p) = playlists.get(self.playlist_overlay.selected_playlist_index) {
-                        self.playlist_overlay.input_mode = PlaylistInputMode::Confirming {
-                            action: ConfirmAction::DeletePlaylist {
-                                id: p.id.clone(),
-                                name: p.name.clone(),
-                            },
-                        };
-                    }
-                }
-            }
-            Action::PlaylistInputChar(c) => match &mut self.playlist_overlay.input_mode {
-                PlaylistInputMode::Creating { buffer }
-                | PlaylistInputMode::Renaming { buffer, .. } => {
-                    if c == '\x08' {
-                        buffer.pop();
-                    } else {
-                        buffer.push(c);
-                    }
-                }
-                _ => {}
-            },
-            Action::PlaylistInputConfirm => {
-                match self.playlist_overlay.input_mode.clone() {
-                    PlaylistInputMode::Creating { buffer } if !buffer.is_empty() => {
-                        self.spawn_create_playlist(buffer);
-                    }
-                    PlaylistInputMode::Renaming {
-                        buffer,
-                        playlist_id,
-                    } if !buffer.is_empty() => {
-                        self.spawn_rename_playlist(playlist_id, buffer);
-                    }
-                    _ => {}
-                }
-                self.playlist_overlay.input_mode = PlaylistInputMode::Normal;
-            }
-            Action::PlaylistInputCancel => {
-                self.playlist_overlay.input_mode = PlaylistInputMode::Normal;
-            }
-            Action::PlaylistConfirmYes => {
-                if let PlaylistInputMode::Confirming {
-                    action: ConfirmAction::DeletePlaylist { id, .. },
-                } = self.playlist_overlay.input_mode.clone()
-                {
-                    self.spawn_delete_playlist(id);
-                    self.playlist_overlay.input_mode = PlaylistInputMode::Normal;
-                }
-            }
-            Action::PlaylistConfirmNo => {
-                self.playlist_overlay.input_mode = PlaylistInputMode::Normal;
-            }
-            Action::PlaylistRemoveTrack => {
-                if let (Some(playlist_id), LoadingState::Loaded(ref songs)) = (
-                    self.playlist_overlay.loaded_playlist_id.clone(),
-                    &self.playlist_overlay.tracks,
-                ) {
-                    if !songs.is_empty() {
-                        let index = self.playlist_overlay.selected_track_index;
-                        self.spawn_remove_track(playlist_id, index);
-                    }
-                }
-            }
-            Action::BrowserAddToPlaylist => {
-                let song = if self.browse_files() {
-                    self.folders
-                        .current_preview_track(self.browser_column_filter(BrowserColumn::Tracks))
-                } else {
-                    self.library.current_track()
-                };
-                if let Some(song) = song {
-                    let song_id = song.id.clone();
-                    match &self.playlist_overlay.playlists {
-                        LoadingState::Loaded(playlists) => {
-                            self.playlist_picker = Some(PlaylistPicker {
-                                playlists: playlists.clone(),
-                                selected_index: 0,
-                                song_id,
-                                loading: false,
-                            });
-                        }
-                        _ => {
-                            self.playlist_picker = Some(PlaylistPicker {
-                                playlists: vec![],
-                                selected_index: 0,
-                                song_id,
-                                loading: true,
-                            });
-                            self.spawn_fetch_playlists_for_picker();
-                        }
-                    }
-                }
-            }
-            Action::PlaylistPickerSelect => {
-                if let Some(ref picker) = self.playlist_picker {
-                    if let Some(playlist) = picker.playlists.get(picker.selected_index) {
-                        let playlist_id = playlist.id.clone();
-                        let playlist_name = playlist.name.clone();
-                        let song_id = picker.song_id.clone();
-                        self.spawn_add_track_to_playlist(playlist_id, playlist_name, song_id);
-                    }
-                }
-                self.playlist_picker = None;
-            }
-            Action::PlaylistPickerCancel => {
-                self.playlist_picker = None;
-            }
-            Action::PlaylistPickerScrollUp => {
-                if let Some(ref mut picker) = self.playlist_picker {
-                    picker.selected_index = picker.selected_index.saturating_sub(1);
-                }
-            }
-            Action::PlaylistPickerScrollDown => {
-                if let Some(ref mut picker) = self.playlist_picker {
-                    let max = picker.playlists.len().saturating_sub(1);
-                    picker.selected_index = (picker.selected_index + 1).min(max);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn spawn_create_playlist(&self, name: String) {
-        let client = self.subsonic.clone();
-        let tx = self.library_tx.clone();
-        tokio::spawn(async move {
-            match client.create_playlist(&name).await {
-                Ok(p) => {
-                    let _ = tx.send(LibraryUpdate::PlaylistCreated(p)).await;
-                }
-                Err(e) => eprintln!("create_playlist failed: {e}"),
-            }
-        });
-    }
-
-    fn spawn_rename_playlist(&self, playlist_id: String, new_name: String) {
-        let client = self.subsonic.clone();
-        let tx = self.library_tx.clone();
-        tokio::spawn(async move {
-            match client.rename_playlist(&playlist_id, &new_name).await {
-                Ok(()) => {
-                    let _ = tx
-                        .send(LibraryUpdate::PlaylistRenamed {
-                            id: playlist_id,
-                            new_name,
-                        })
-                        .await;
-                }
-                Err(e) => eprintln!("rename_playlist failed: {e}"),
-            }
-        });
-    }
-
-    fn spawn_delete_playlist(&self, id: String) {
-        let client = self.subsonic.clone();
-        let tx = self.library_tx.clone();
-        tokio::spawn(async move {
-            match client.delete_playlist(&id).await {
-                Ok(()) => {
-                    let _ = tx.send(LibraryUpdate::PlaylistDeleted(id)).await;
-                }
-                Err(e) => eprintln!("delete_playlist failed: {e}"),
-            }
-        });
-    }
-
-    fn spawn_remove_track(&self, playlist_id: String, index: usize) {
-        let client = self.subsonic.clone();
-        let tx = self.library_tx.clone();
-        tokio::spawn(async move {
-            match client.remove_track_from_playlist(&playlist_id, index).await {
-                Ok(()) => {
-                    let _ = tx
-                        .send(LibraryUpdate::PlaylistTrackRemoved {
-                            _playlist_id: playlist_id,
-                            index,
-                        })
-                        .await;
-                }
-                Err(e) => eprintln!("remove_track_from_playlist failed: {e}"),
-            }
-        });
-    }
-
-    fn spawn_fetch_playlists_for_picker(&self) {
-        let client = self.subsonic.clone();
-        let tx = self.library_tx.clone();
-        tokio::spawn(async move {
-            match client.get_playlists().await {
-                Ok(list) => {
-                    let _ = tx.send(LibraryUpdate::PlaylistsForPicker(list)).await;
-                }
-                Err(e) => eprintln!("get_playlists for picker failed: {e}"),
-            }
-        });
-    }
-
-    fn spawn_add_track_to_playlist(
-        &self,
-        playlist_id: String,
-        playlist_name: String,
-        song_id: String,
-    ) {
-        let client = self.subsonic.clone();
-        let tx = self.library_tx.clone();
-        tokio::spawn(async move {
-            match client.add_track_to_playlist(&playlist_id, &song_id).await {
-                Ok(()) => {
-                    let _ = tx
-                        .send(LibraryUpdate::PlaylistTrackAdded {
-                            _playlist_id: playlist_id,
-                            playlist_name,
-                        })
-                        .await;
-                }
-                Err(e) => eprintln!("add_track_to_playlist failed: {e}"),
-            }
-        });
-    }
 }

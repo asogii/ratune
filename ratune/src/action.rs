@@ -117,52 +117,6 @@ pub enum Action {
     HomeAlbumPlay,
     /// Append the selected album (strip) to queue without clearing.
     HomeAlbumAddToQueue,
-    /// Toggle the playlist browser overlay.
-    TogglePlaylistOverlay,
-    /// Scroll up within the playlist overlay (list or tracks pane).
-    PlaylistScrollUp,
-    /// Scroll down within the playlist overlay (list or tracks pane).
-    PlaylistScrollDown,
-    /// Move focus to the tracks pane of the playlist overlay.
-    PlaylistFocusTracks,
-    /// Move focus back to the playlist list pane of the overlay.
-    PlaylistFocusList,
-    /// Replace the queue with all tracks from the selected playlist and play.
-    PlaylistPlayAll,
-    /// Append all tracks from the selected playlist to the queue.
-    PlaylistAppendAll,
-    /// Replace the queue with the highlighted track and play.
-    PlaylistPlayTrack,
-    /// Append the highlighted track to the queue.
-    PlaylistAppendTrack,
-    /// Create a new playlist (opens the name-input prompt).
-    PlaylistCreate,
-    /// Delete the currently selected playlist (opens confirmation prompt).
-    PlaylistDelete,
-    /// Rename the currently selected playlist (opens the rename-input prompt).
-    PlaylistRename,
-    /// Remove the highlighted track from the current playlist.
-    PlaylistRemoveTrack,
-    /// Open the playlist picker to add the focused browser track to a playlist.
-    BrowserAddToPlaylist,
-    /// Confirm selection in the playlist picker.
-    PlaylistPickerSelect,
-    /// Cancel and close the playlist picker.
-    PlaylistPickerCancel,
-    /// Scroll up in the playlist picker.
-    PlaylistPickerScrollUp,
-    /// Scroll down in the playlist picker.
-    PlaylistPickerScrollDown,
-    /// Confirm the current text-input field (create / rename).
-    PlaylistInputConfirm,
-    /// Cancel the current text-input field.
-    PlaylistInputCancel,
-    /// Feed a character into the active text-input buffer.
-    PlaylistInputChar(char),
-    /// Confirm the yes/no confirmation prompt.
-    PlaylistConfirmYes,
-    /// Decline the yes/no confirmation prompt.
-    PlaylistConfirmNo,
     /// Open the fzf (or `sk`) track picker using the local metadata index.
     LibraryFzfPicker,
     /// Force a full refresh of the metadata index from Subsonic.

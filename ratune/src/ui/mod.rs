@@ -10,7 +10,6 @@ pub mod layout;
 pub mod now_playing;
 pub mod now_playing_format;
 pub mod nowplaying_tab;
-pub mod playlist_overlay;
 pub mod playlists;
 pub mod popup;
 pub mod queue;
