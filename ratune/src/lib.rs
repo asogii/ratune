@@ -761,6 +761,18 @@ async fn run_loop(
                                                 }
                                             }
                                         }
+                                    } else if app.playlists_tab.pending_delete_playlist.is_some() {
+                                        match key.code {
+                                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                                Action::PlaylistsConfirmDelete
+                                            }
+                                            KeyCode::Char('n') | KeyCode::Char('N')
+                                            | KeyCode::Esc => {
+                                                app.playlists_tab.pending_delete_playlist = None;
+                                                Action::None
+                                            }
+                                            _ => Action::None,
+                                        }
                                     } else if app.playlists_tab.save_input.is_some()
                                     {
                                         handle_playlists_save_input(key.code, key.modifiers, app)

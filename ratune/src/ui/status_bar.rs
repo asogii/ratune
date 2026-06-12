@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -90,7 +90,17 @@ fn push_scrobble_status_spans(
 pub fn render(app: &App, frame: &mut Frame, area: Rect) {
     let t = &app.theme;
 
-    let line = if let Some(input) = &app.playlists_tab.save_input {
+    let line = if let Some(ref name) = app.playlists_tab.pending_delete_playlist {
+        Line::from(vec![
+            Span::styled("Delete ", Style::default().fg(app.accent())),
+            Span::styled(name, Style::default().fg(t.foreground)),
+            Span::styled("?  (", Style::default().fg(t.dimmed)),
+            Span::styled("y", Style::default().fg(app.accent()).add_modifier(Modifier::BOLD)),
+            Span::styled("/", Style::default().fg(t.dimmed)),
+            Span::styled("n", Style::default().fg(t.dimmed)),
+            Span::styled(")", Style::default().fg(t.dimmed)),
+        ])
+    } else if let Some(input) = &app.playlists_tab.save_input {
         Line::from(vec![
             Span::styled("Save as: ", Style::default().fg(app.accent())),
             Span::styled(

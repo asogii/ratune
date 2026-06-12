@@ -279,6 +279,8 @@ pub struct PlaylistsTabState {
     pub saved_path: Option<std::path::PathBuf>,
     /// When Some, user is asked to confirm deleting this track index.
     pub pending_delete_track: Option<usize>,
+    /// When Some, user is asked to confirm deleting the selected Saved playlist.
+    pub pending_delete_playlist: Option<String>,
 }
 
 impl Default for PlaylistsTabState {
@@ -301,6 +303,7 @@ impl Default for PlaylistsTabState {
             dirty_since: None,
             saved_path: None,
             pending_delete_track: None,
+            pending_delete_playlist: None,
         }
     }
 }
@@ -3594,7 +3597,13 @@ impl App {
             Action::PlaylistsReRandom => self.handle_playlists_rerandom(),
             Action::PlaylistsDeleteTrack => self.handle_playlists_delete_track(),
             Action::PlaylistsConfirmDelete => {
-                // No-op: delete is immediate (no confirm prompt needed for now)
+                if let Some(name) = self.playlists_tab.pending_delete_playlist.take() {
+                    if let Ok(dir) = crate::persist::playlists_dir() {
+                        let path = dir.join(format!("{name}.json"));
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    self.refresh_playlists_tab();
+                }
             }
             Action::ToggleRepeatMode => self.handle_toggle_repeat_mode(),
             Action::ToggleFavorite => self.handle_toggle_favorite(),
@@ -4347,11 +4356,22 @@ impl App {
         self.refetch_random_playlist();
     }
 
-    /// Delete selected track from playlist (right panel).
+    /// Delete selected track from playlist (right panel) or delete saved playlist (left panel).
     fn handle_playlists_delete_track(&mut self) {
-        if self.active_tab != Tab::Playlists || self.playlists_tab.focus_left {
+        if self.active_tab != Tab::Playlists {
             return;
         }
+        // Left panel: delete a --Saved-- playlist.
+        if self.playlists_tab.focus_left {
+            let idx = self.playlists_tab.selected;
+            if matches!(self.playlists_tab.items.get(idx), Some(PlaylistItem::Saved { name, .. })) {
+                if let Some(PlaylistItem::Saved { name, .. }) = self.playlists_tab.items.get(idx).cloned() {
+                    self.playlists_tab.pending_delete_playlist = Some(name.clone());
+                }
+            }
+            return;
+        }
+        // Right panel: delete a track from the current playlist.
         let c = self.playlists_tab.selected_track;
         if c >= self.playlists_tab.tracks.len() {
             return;
