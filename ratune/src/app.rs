@@ -3596,15 +3596,7 @@ impl App {
             Action::PlaylistsSaveQueue => self.handle_playlists_save_queue(),
             Action::PlaylistsReRandom => self.handle_playlists_rerandom(),
             Action::PlaylistsDeleteTrack => self.handle_playlists_delete_track(),
-            Action::PlaylistsConfirmDelete => {
-                if let Some(name) = self.playlists_tab.pending_delete_playlist.take() {
-                    if let Ok(dir) = crate::persist::playlists_dir() {
-                        let path = dir.join(format!("{name}.json"));
-                        let _ = std::fs::remove_file(&path);
-                    }
-                    self.refresh_playlists_tab();
-                }
-            }
+            Action::PlaylistsConfirmDelete => self.handle_playlists_confirm_delete(),
             Action::ToggleRepeatMode => self.handle_toggle_repeat_mode(),
             Action::ToggleFavorite => self.handle_toggle_favorite(),
             Action::None => {}
@@ -3712,17 +3704,6 @@ impl App {
         }
     }
 
-    fn handle_playlists_save_queue(&mut self) {
-        if self.active_tab == Tab::Playlists || self.active_tab == Tab::NowPlaying {
-            if self.playlists_tab.save_input.is_some() {
-                self.finish_save_queue();
-            } else {
-                self.playlists_tab.save_input = Some(String::new());
-            }
-        }
-    }
-
-    // ── Navigation ────────────────────────────────────────────────────────────
 
     fn handle_navigate(&mut self, dir: Direction) {
         match self.active_tab {
@@ -4342,157 +4323,6 @@ impl App {
     }
 
     /// Re-random: explicit refresh of random playlist (r key).
-    fn handle_playlists_rerandom(&mut self) {
-        if self.active_tab != Tab::Playlists {
-            return;
-        }
-        // Only re-random when Random item is selected in left panel.
-        let idx = self.playlists_tab.selected;
-        if !matches!(self.playlists_tab.items.get(idx), Some(PlaylistItem::Random)) {
-            return;
-        }
-        self.playlists_tab.random_tracks_cached = None;
-        self.playlists_tab.load_gen = self.playlists_tab.load_gen.wrapping_add(1);
-        self.refetch_random_playlist();
-    }
-
-    /// Delete selected track from playlist (right panel) or delete saved playlist (left panel).
-    fn handle_playlists_delete_track(&mut self) {
-        if self.active_tab != Tab::Playlists {
-            return;
-        }
-        // Left panel: delete a --Saved-- playlist.
-        if self.playlists_tab.focus_left {
-            let idx = self.playlists_tab.selected;
-            if matches!(self.playlists_tab.items.get(idx), Some(PlaylistItem::Saved { name, .. })) {
-                if let Some(PlaylistItem::Saved { name, .. }) = self.playlists_tab.items.get(idx).cloned() {
-                    self.playlists_tab.pending_delete_playlist = Some(name.clone());
-                }
-            }
-            return;
-        }
-        // Right panel: delete a track from the current playlist.
-        let c = self.playlists_tab.selected_track;
-        if c >= self.playlists_tab.tracks.len() {
-            return;
-        }
-        // For Favorites, immediately unstar + remove without confirm.
-        let idx = self.playlists_tab.selected;
-        if matches!(self.playlists_tab.items.get(idx), Some(PlaylistItem::Favorites)) {
-            if let Some(song) = self.playlists_tab.tracks.get(c) {
-                let song_id = song.id.clone();
-                let client = self.subsonic.clone();
-                tokio::spawn(async move {
-                    let _ = client.unstar_song(&song_id).await;
-                });
-            }
-            self.playlists_tab.tracks.remove(c);
-            self.playlists_tab.tracks_cache.insert(idx, self.playlists_tab.tracks.clone());
-            self.playlists_tab.selected_track =
-                self.playlists_tab.selected_track.min(self.playlists_tab.tracks.len().saturating_sub(1));
-            return;
-        }
-        // For other playlists, remove immediately (auto-save handles persistence).
-        self.playlists_tab.tracks.remove(c);
-        self.playlists_tab.tracks_cache.insert(idx, self.playlists_tab.tracks.clone());
-        self.playlists_tab.selected_track =
-            self.playlists_tab.selected_track.min(self.playlists_tab.tracks.len().saturating_sub(1));
-        // Mark dirty for auto-save.
-        if self.playlists_tab.dirty_since.is_none() {
-            self.playlists_tab.dirty_since = Some(std::time::Instant::now());
-        }
-    }
-
-    // ── Playlists tab helpers ──────────────────────────────────────────────────
-
-    fn handle_playlists_append(&mut self) {
-        if self.active_tab != Tab::Playlists || self.playlists_tab.focus_left {
-            return;
-        }
-        if let Some(song) = self.playlists_tab.tracks.get(self.playlists_tab.selected_track).cloned() {
-            let was_empty = self.queue.songs.is_empty();
-            self.queue.push(song);
-            if was_empty {
-                self.queue.cursor = 0;
-                self.play_current();
-            }
-        }
-    }
-
-    fn handle_playlists_prepend(&mut self) {
-        if self.active_tab != Tab::Playlists || self.playlists_tab.focus_left {
-            return;
-        }
-        if let Some(song) = self.playlists_tab.tracks.get(self.playlists_tab.selected_track).cloned() {
-            self.queue.prepend_songs(vec![song]);
-        }
-    }
-
-    fn handle_playlists_insert_next(&mut self) {
-        if self.active_tab != Tab::Playlists || self.playlists_tab.focus_left {
-            return;
-        }
-        if let Some(song) = self.playlists_tab.tracks.get(self.playlists_tab.selected_track).cloned() {
-            // Insert after current playing position.
-            let insert_at = self.queue.cursor + 1;
-            if insert_at <= self.queue.songs.len() {
-                self.queue.songs.insert(insert_at, song);
-            }
-        }
-    }
-
-    fn handle_playlists_toggle_count(&mut self) {
-        if self.active_tab != Tab::Playlists {
-            return;
-        }
-        let idx = self.playlists_tab.selected;
-        let Some(item) = self.playlists_tab.items.get(idx).cloned() else {
-            return;
-        };
-        match item {
-            PlaylistItem::Favorites => {
-                // Cycle: 0 = all, 20, 50, 100
-                let count = match self.playlists_tab.favorites_count {
-                    0 => 20,
-                    20 => 50,
-                    50 => 100,
-                    _ => 0,
-                };
-                self.playlists_tab.favorites_count = count;
-                self.playlists_tab.load_gen = self.playlists_tab.load_gen.wrapping_add(1);
-                let client = self.subsonic.clone();
-                let tx = self.library_tx.clone();
-                let gen = self.playlists_tab.load_gen;
-                self.playlists_tab.tracks.clear();
-                tokio::spawn(async move {
-                    // Always fetch starred (favorited) songs, truncate locally.
-                    match client.get_starred().await {
-                        Ok(mut starred) => {
-                            if count > 0 {
-                                starred.truncate(count as usize);
-                            }
-                            let _ = tx.send(LibraryUpdate::PlaylistsTabTracks(starred, gen)).await;
-                        }
-                        Err(e) => eprintln!("fetch favorites: {e}"),
-                    }
-                });
-            }
-            PlaylistItem::Random => {
-                let count = match self.playlists_tab.random_count {
-                    20 => 50,
-                    50 => 100,
-                    _ => 20,
-                };
-                self.playlists_tab.random_count = count;
-                // Invalidate cache and refetch with new count.
-                self.playlists_tab.random_tracks_cached = None;
-                self.playlists_tab.load_gen = self.playlists_tab.load_gen.wrapping_add(1);
-                self.refetch_random_playlist();
-            }
-            _ => {}
-        }
-    }
-
     // ── Queue reorder helpers ──────────────────────────────────────────────────
 
     fn handle_queue_move_up(&mut self) {

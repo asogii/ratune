@@ -4,14 +4,14 @@ pub mod artists;
 pub mod browser;
 pub mod folder_tracks;
 pub mod folders;
-pub mod home_tab;
+pub mod home;
 pub mod kitty_art;
 pub mod layout;
 pub mod now_playing;
 pub mod now_playing_format;
 pub mod nowplaying_tab;
 pub mod playlist_overlay;
-pub mod playlists_tab;
+pub mod playlists;
 pub mod popup;
 pub mod queue;
 pub mod status_bar;
@@ -22,8 +22,6 @@ pub mod visualizer;
 
 use crate::app::{App, Tab};
 use ratatui::Frame;
-
-use home_tab::render_home_tab;
 
 // Colour palette constants removed — all colours are now accessed via
 // `app.theme.*` (see `ratune/src/theme.rs`) so that the [theme] config
@@ -37,7 +35,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     match app.active_tab {
         Tab::Home => {
             let areas = layout::build_layout(frame.area(), &layout::layout_options_for_app(app));
-            render_home_tab(frame, areas.center, app, app.accent(), app.help_visible);
+            home::render_home_tab(frame, areas.center, app, app.accent(), app.help_visible);
             now_playing::render(app, frame, areas.now_playing);
             status_bar::render(app, frame, areas.status_bar);
             // Tab bar (skip if terminal is too small).
@@ -69,7 +67,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         }
         Tab::Playlists => {
             let areas = layout::build_layout(frame.area(), &layout::layout_options_for_app(app));
-            playlists_tab::render(frame, areas.center, app);
+            playlists::render(frame, areas.center, app);
             now_playing::render(app, frame, areas.now_playing);
             status_bar::render(app, frame, areas.status_bar);
             // Tab bar (skip if terminal is too small).
