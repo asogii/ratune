@@ -51,6 +51,10 @@ pub enum Action {
     PlaylistsInsertNext,
     /// Playlists tab: toggle count (Favorites/Random)
     PlaylistsToggleCount,
+    /// Playlists tab: delete selected track from playlist
+    PlaylistsDeleteTrack,
+    /// Playlists tab: confirm delete track
+    PlaylistsConfirmDelete,
     /// Playlists tab: re-fetch random songs
     PlaylistsReRandom,
     /// Toggle repeat mode (none → one → all → none)

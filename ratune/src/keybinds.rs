@@ -344,11 +344,11 @@ impl Keybinds {
             ),
             go_to_nowplaying: resolve(
                 sec.go_to_nowplaying.as_deref(),
-                KeySpec::new(KeyCode::Char('3')),
+                KeySpec::new(KeyCode::Char('4')),
             ),
             go_to_playlists: resolve(
                 sec.go_to_playlists.as_deref(),
-                KeySpec::new(KeyCode::Char('4')),
+                KeySpec::new(KeyCode::Char('3')),
             ),
             quit: resolve(sec.quit.as_deref(), KeySpec::new(KeyCode::Char('q'))),
             library_fzf,

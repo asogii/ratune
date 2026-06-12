@@ -67,9 +67,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 );
             }
         }
-        Tab::NowPlaying => {
+        Tab::Playlists => {
             let areas = layout::build_layout(frame.area(), &layout::layout_options_for_app(app));
-            nowplaying_tab::render(app, frame, areas.center);
+            playlists_tab::render(frame, areas.center, app);
             now_playing::render(app, frame, areas.now_playing);
             status_bar::render(app, frame, areas.status_bar);
             // Tab bar (skip if terminal is too small).
@@ -83,9 +83,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 );
             }
         }
-        Tab::Playlists => {
+        Tab::NowPlaying => {
             let areas = layout::build_layout(frame.area(), &layout::layout_options_for_app(app));
-            playlists_tab::render(frame, areas.center, app);
+            nowplaying_tab::render(app, frame, areas.center);
             now_playing::render(app, frame, areas.now_playing);
             status_bar::render(app, frame, areas.status_bar);
             // Tab bar (skip if terminal is too small).

@@ -1,12 +1,12 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState};
 use ratatui::Frame;
 
 use crate::app::App;
 use crate::theme::style_with_bg;
 
-const DEFAULT_QUEUE_TEMPLATE: &str = "{n}  {title:<40}  {artist:<25}  {duration:>5}";
+const DEFAULT_QUEUE_TEMPLATE: &str = "{heart} {title:<40}  {artist:<25}  {duration:>5}";
 
 pub fn render(app: &mut App, frame: &mut Frame, area: Rect, is_active: bool) {
     let visible = area.height.saturating_sub(2) as usize;
@@ -68,7 +68,14 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect, is_active: bool) {
             let idx = start + offset;
             let label = format_queue_line(template, s);
 
+            let is_playing = app.playback.current_song.as_ref().is_some_and(|cs| cs.id == s.id);
             let style = if idx == app.queue.cursor {
+                // Cursor: background highlight
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(t.border_active)
+            } else if is_playing {
+                // Currently playing: foreground accent, no background
                 Style::default()
                     .fg(app.accent())
                     .add_modifier(Modifier::BOLD)
@@ -114,6 +121,13 @@ fn format_queue_line(template: &str, s: &ratune_subsonic::Song) -> String {
         "artist" => Some(artist.to_string()),
         "album" => Some(album.to_string()),
         "duration" => Some(duration.clone()),
+        "heart" | "starred" => {
+            if s.starred.is_some() {
+                Some("\u{f02d1}".to_string())
+            } else {
+                Some(" ".to_string())
+            }
+        }
         "suffix" => Some(
             s.suffix
                 .as_deref()

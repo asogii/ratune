@@ -506,17 +506,17 @@ fn render_row(app: &App, frame: &mut Frame, area: Rect) {
 fn render_controls_widget(app: &App, frame: &mut Frame, area: Rect) {
     let t = &app.theme;
     let (play_label, play_style) = if app.playback.current_song.is_none() {
-        ("▶", Style::default().fg(t.dimmed))
+        ("\u{f04b}", Style::default().fg(t.dimmed))
     } else if app.playback.paused {
         (
-            "( ▶ )",
+            "\u{f04b}",
             Style::default()
                 .fg(app.accent())
                 .add_modifier(Modifier::BOLD),
         )
     } else {
         (
-            "( ⏸ )",
+            "\u{f04c}",
             Style::default()
                 .fg(app.accent())
                 .add_modifier(Modifier::BOLD),
@@ -530,10 +530,11 @@ fn render_controls_widget(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         sep
     };
+    let fav_icon = if is_fav { "\u{f02d1}" } else { "\u{f02d5}" };
     let repeat_label = match app.playback.repeat_mode {
-        crate::state::RepeatMode::None => "↻",
-        crate::state::RepeatMode::All => "↻+",
-        crate::state::RepeatMode::One => "↺1",
+        crate::state::RepeatMode::None => "\u{f0457}",
+        crate::state::RepeatMode::All => "\u{f0456}",
+        crate::state::RepeatMode::One => "\u{f0458}",
     };
     let repeat_style = if app.playback.repeat_mode == crate::state::RepeatMode::None {
         sep
@@ -541,17 +542,17 @@ fn render_controls_widget(app: &App, frame: &mut Frame, area: Rect) {
         Style::default().fg(app.accent()).add_modifier(Modifier::BOLD)
     };
     let controls = Line::from(vec![
-        Span::styled("⇄", sep),
+        Span::styled("\u{f074}", sep),
         Span::raw("  "),
-        Span::styled("⏮", sep),
+        Span::styled("\u{f048}", sep),
         Span::raw("  "),
         Span::styled(play_label, play_style),
         Span::raw("  "),
-        Span::styled("⏭", sep),
+        Span::styled("\u{f051}", sep),
         Span::raw("  "),
         Span::styled(repeat_label, repeat_style),
         Span::raw("  "),
-        Span::styled("♡", fav_style),
+        Span::styled(fav_icon, fav_style),
     ]);
 
     if area.height <= 1 {

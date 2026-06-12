@@ -407,6 +407,21 @@ async fn run_loop(
         // Expire status flash messages.
         app.tick_status_flash();
 
+        // 30s debounced auto-save for modified --Saved-- playlists.
+        if let Some(since) = app.playlists_tab.dirty_since {
+            if since.elapsed() >= std::time::Duration::from_secs(30) {
+                if let Some(path) = &app.playlists_tab.saved_path {
+                    let idx = app.playlists_tab.selected;
+                    if let Some(cached) = app.playlists_tab.tracks_cache.get(&idx) {
+                        if let Ok(json) = serde_json::to_string_pretty(cached) {
+                            let _ = std::fs::write(path, &json);
+                        }
+                    }
+                }
+                app.playlists_tab.dirty_since = None;
+            }
+        }
+
         // Apply completed NP encodes before draw (previous frame) and after draw (same-frame worker).
         drain_ratatui_np_resize_completions(app);
 
@@ -746,8 +761,7 @@ async fn run_loop(
                                                 }
                                             }
                                         }
-                                    } else if app.active_tab == Tab::Playlists
-                                        && app.playlists_tab.save_input.is_some()
+                                    } else if app.playlists_tab.save_input.is_some()
                                     {
                                         handle_playlists_save_input(key.code, key.modifiers, app)
                                     } else {
@@ -916,6 +930,18 @@ async fn run_loop(
     // Persist UI state on clean quit.
     if let Err(e) = persist::save_state(app) {
         eprintln!("warn: could not save state: {e}");
+    }
+    // Save any dirty playlist caches before exiting.
+    if let Some(since) = app.playlists_tab.dirty_since {
+        // Always save dirty items regardless of 30s timer on quit.
+        let idx = app.playlists_tab.selected;
+        if let Some(path) = &app.playlists_tab.saved_path {
+            if let Some(cached) = app.playlists_tab.tracks_cache.get(&idx) {
+                if let Ok(json) = serde_json::to_string_pretty(cached) {
+                    let _ = std::fs::write(path, &json);
+                }
+            }
+        }
     }
     // Persist play history.
     let history_path = history::history_path();
@@ -1339,7 +1365,11 @@ fn map_key(
         if code == KeyCode::Char('e') && modifiers.is_empty() {
             return Action::PlaylistsToggleCount;
         }
-        // s: save queue
+        // d: delete track from playlist (right panel only)
+        if code == KeyCode::Char('d') && modifiers.is_empty() {
+            return Action::PlaylistsDeleteTrack;
+        }
+        // s: save playlist
         if code == KeyCode::Char('s') && modifiers.is_empty() {
             return Action::PlaylistsSaveQueue;
         }
@@ -1350,6 +1380,10 @@ fn map_key(
     }
 
     // ── Always-on / non-configurable ─────────────────────────────────────────
+    // s in NowPlaying tab: save queue.
+    if active_tab == Tab::NowPlaying && code == KeyCode::Char('s') && modifiers.is_empty() {
+        return Action::PlaylistsSaveQueue;
+    }
     // G: jump to bottom — not exposed in config. Top is `gg` (handled via pending_gg).
     // Terminals usually send Shift+G as `Char('G')` with SHIFT set, not bare `G`.
     if code == KeyCode::Char('G')
@@ -1488,26 +1522,29 @@ fn map_key(
     }
 
     // add_all variants must be checked before add_track (superset keys).
-    if let Some(spec) = &kb.add_all_replace_artist {
-        if spec.matches(code, modifiers) {
-            return Action::AddAllToQueueReplaceArtist;
+    // Only work in Browser tab (not Playlists or Home).
+    if active_tab == Tab::Browser {
+        if let Some(spec) = &kb.add_all_replace_artist {
+            if spec.matches(code, modifiers) {
+                return Action::AddAllToQueueReplaceArtist;
+            }
         }
-    }
-    if let Some(spec) = &kb.add_all_replace_album {
-        if spec.matches(code, modifiers) {
-            return Action::AddAllToQueueReplaceAlbum;
+        if let Some(spec) = &kb.add_all_replace_album {
+            if spec.matches(code, modifiers) {
+                return Action::AddAllToQueueReplaceAlbum;
+            }
         }
-    }
-    if let Some(spec) = &kb.add_all_prepend {
-        if spec.matches(code, modifiers) {
-            return Action::AddAllToQueuePrepend;
+        if let Some(spec) = &kb.add_all_prepend {
+            if spec.matches(code, modifiers) {
+                return Action::AddAllToQueuePrepend;
+            }
         }
-    }
-    if kb.add_all.matches(code, modifiers) {
-        return Action::AddAllToQueue;
-    }
-    if kb.add_track.matches(code, modifiers) {
-        return Action::AddToQueue;
+        if kb.add_all.matches(code, modifiers) {
+            return Action::AddAllToQueue;
+        }
+        if kb.add_track.matches(code, modifiers) {
+            return Action::AddToQueue;
+        }
     }
 
     if kb.shuffle.matches(code, modifiers) {
@@ -1734,23 +1771,23 @@ fn handle_mouse_click(x: u16, y: u16, app: &mut App, terminal_size: ratatui::lay
 
     // ── Tab bar: dispatch GoToHome / GoToBrowser / GoToNowPlaying / GoToPlaylists ─
     if y == areas.tab_bar.y {
-        // Labels: " Home " (6) " │ " (3) " Browse " (8) " │ " (3) " Now Playing " (13)
-        //         " │ " (3) " Playlists " (11)
+        // Labels: " Home " (6) " │ " (3) " Browse " (8) " │ " (3) " Playlists " (11)
+        //         " │ " (3) " Now Playing " (13)
         let home_end: u16 = 6;
         let browser_start: u16 = 9;   // 6+3
         let browser_end: u16 = 17;    // 9+8
-        let np_start: u16 = 20;       // 17+3
-        let np_end: u16 = 33;         // 20+13
-        let pl_start: u16 = 36;       // 33+3
+        let pl_start: u16 = 20;       // 17+3
+        let pl_end: u16 = 31;         // 20+11
+        let np_start: u16 = 34;       // 31+3
 
         let action = if x < home_end {
             Action::GoToHome
         } else if x >= browser_start && x < browser_end {
             Action::GoToBrowser
-        } else if x >= np_start && x < np_end {
-            Action::GoToNowPlaying
-        } else if x >= pl_start {
+        } else if x >= pl_start && x < pl_end {
             Action::GoToPlaylists
+        } else if x >= np_start {
+            Action::GoToNowPlaying
         } else {
             Action::None // clicked a separator
         };

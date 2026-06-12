@@ -75,9 +75,9 @@ pub fn render_tab_bar(f: &mut Frame, area: Rect, active_tab: Tab, accent: Color,
         separator.clone(),
         span_browser,
         separator.clone(),
-        span_nowplaying,
-        separator,
         span_playlists,
+        separator,
+        span_nowplaying,
     ]);
 
     let para = Paragraph::new(line).style(style_with_bg(theme.tab_bar));

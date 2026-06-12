@@ -96,28 +96,28 @@ pub enum Tab {
     #[default]
     Home,
     Browser,
-    NowPlaying,
     Playlists,
+    NowPlaying,
 }
 
 impl Tab {
-    /// Cycle forward: Home → Browser → NowPlaying → Playlists → Home
+    /// Cycle forward: Home → Browser → Playlists → NowPlaying → Home
     pub fn next(self) -> Self {
         match self {
             Tab::Home => Tab::Browser,
-            Tab::Browser => Tab::NowPlaying,
-            Tab::NowPlaying => Tab::Playlists,
-            Tab::Playlists => Tab::Home,
+            Tab::Browser => Tab::Playlists,
+            Tab::Playlists => Tab::NowPlaying,
+            Tab::NowPlaying => Tab::Home,
         }
     }
 
-    /// Cycle backward: Home → Playlists → NowPlaying → Browser → Home
+    /// Cycle backward: Home → NowPlaying → Playlists → Browser → Home
     pub fn prev(self) -> Self {
         match self {
-            Tab::Home => Tab::Playlists,
+            Tab::Home => Tab::NowPlaying,
             Tab::Browser => Tab::Home,
-            Tab::NowPlaying => Tab::Browser,
-            Tab::Playlists => Tab::NowPlaying,
+            Tab::Playlists => Tab::Browser,
+            Tab::NowPlaying => Tab::Playlists,
         }
     }
 
@@ -267,6 +267,18 @@ pub struct PlaylistsTabState {
     pub random_count: u32,
     /// Cached random songs — only refreshed on explicit action.
     pub random_tracks_cached: Option<Vec<ratune_subsonic::Song>>,
+    /// Generation counter incremented on each load_selected_playlist call.
+    pub load_gen: u64,
+    /// Per-item tracks cache keyed by left-panel index.
+    /// Populated on first load, cleared only on explicit refresh.
+    pub tracks_cache: std::collections::HashMap<usize, Vec<ratune_subsonic::Song>>,
+    /// When the currently loaded tracks are dirty (modified),
+    /// this stores the Instant when the first modification happened.
+    pub dirty_since: Option<std::time::Instant>,
+    /// The saved path for the currently loaded Saved playlist.
+    pub saved_path: Option<std::path::PathBuf>,
+    /// When Some, user is asked to confirm deleting this track index.
+    pub pending_delete_track: Option<usize>,
 }
 
 impl Default for PlaylistsTabState {
@@ -284,6 +296,11 @@ impl Default for PlaylistsTabState {
             favorites_count: 0,
             random_count: 20,
             random_tracks_cached: None,
+            load_gen: 0,
+            tracks_cache: std::collections::HashMap::new(),
+            dirty_since: None,
+            saved_path: None,
+            pending_delete_track: None,
         }
     }
 }
@@ -344,7 +361,7 @@ pub enum LibraryUpdate {
         bytes: Vec<u8>,
     },
     /// Tracks loaded for the Playlists tab (favorites, random, etc.).
-    PlaylistsTabTracks(Vec<ratune_subsonic::Song>),
+    PlaylistsTabTracks(Vec<ratune_subsonic::Song>, u64),
     /// Home strip cover fetch failed — release loading slot so more fetches can run.
     HomeArtFetchFailed {
         album_id: String,
@@ -2159,13 +2176,24 @@ impl App {
                 self.home_art_loading.remove(&album_id);
                 self.spawn_pending_home_art_fetches();
             }
-            LibraryUpdate::PlaylistsTabTracks(songs) => {
+            LibraryUpdate::PlaylistsTabTracks(songs, gen) => {
+                if gen != self.playlists_tab.load_gen {
+                    // Stale response — user navigated to a different item.
+                    return;
+                }
                 self.playlists_tab.tracks = songs.clone();
                 self.playlists_tab.selected_track = 0;
-                // Cache in random_tracks_cached if Random is currently selected.
+                // Cache in tracks_cache and random_tracks_cached if Random.
                 let idx = self.playlists_tab.selected;
+                self.playlists_tab.tracks_cache.insert(idx, songs.clone());
                 if matches!(self.playlists_tab.items.get(idx), Some(PlaylistItem::Random)) {
                     self.playlists_tab.random_tracks_cached = Some(songs);
+                }
+                // Mark dirty if this is a Saved playlist (for auto-save).
+                if matches!(self.playlists_tab.items.get(idx), Some(PlaylistItem::Saved { .. })) {
+                    if self.playlists_tab.dirty_since.is_none() {
+                        self.playlists_tab.dirty_since = Some(std::time::Instant::now());
+                    }
                 }
             }
             LibraryUpdate::Playlists(playlists) => {
@@ -2652,14 +2680,21 @@ impl App {
                 }
             }
             PlayerEvent::TrackEnded => {
-                if self.queue.next() {
+                use crate::state::RepeatMode;
+                // Repeat-one: replay the current track.
+                if self.playback.repeat_mode == RepeatMode::One {
+                    if self.queue.current().is_some() {
+                        self.play_current();
+                    }
+                } else if self.queue.next() {
                     self.play_current();
-                } else if !self.queue.songs.is_empty() {
-                    // End of queue — loop back to the first track.
+                } else if !self.queue.songs.is_empty() && self.playback.repeat_mode == RepeatMode::All {
+                    // Repeat-all: loop back to the first track.
                     self.queue.cursor = 0;
                     self.queue.scroll = 0;
                     self.play_current();
                 } else {
+                    // No-repeat (None) or empty queue: stop.
                     self.playback.current_song = None;
                     self.playback.elapsed = std::time::Duration::ZERO;
                 }
@@ -3557,6 +3592,10 @@ impl App {
             Action::PlaylistsToggleCount => self.handle_playlists_toggle_count(),
             Action::PlaylistsSaveQueue => self.handle_playlists_save_queue(),
             Action::PlaylistsReRandom => self.handle_playlists_rerandom(),
+            Action::PlaylistsDeleteTrack => self.handle_playlists_delete_track(),
+            Action::PlaylistsConfirmDelete => {
+                // No-op: delete is immediate (no confirm prompt needed for now)
+            }
             Action::ToggleRepeatMode => self.handle_toggle_repeat_mode(),
             Action::ToggleFavorite => self.handle_toggle_favorite(),
             Action::None => {}
@@ -3665,13 +3704,12 @@ impl App {
     }
 
     fn handle_playlists_save_queue(&mut self) {
-        if self.active_tab != Tab::Playlists {
-            return;
-        }
-        if self.playlists_tab.save_input.is_some() {
-            self.finish_save_queue();
-        } else {
-            self.playlists_tab.save_input = Some(String::new());
+        if self.active_tab == Tab::Playlists || self.active_tab == Tab::NowPlaying {
+            if self.playlists_tab.save_input.is_some() {
+                self.finish_save_queue();
+            } else {
+                self.playlists_tab.save_input = Some(String::new());
+            }
         }
     }
 
@@ -4060,75 +4098,28 @@ impl App {
 
     fn handle_navigate_playlists(&mut self, dir: Direction) {
         if self.playlists_tab.focus_left {
-            let len = self.playlists_tab.items.len();
-            if len == 0 {
+            // Build list of non-header indices.
+            let non_headers: Vec<usize> = self.playlists_tab.items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| !matches!(item, PlaylistItem::Header(_)))
+                .map(|(i, _)| i)
+                .collect();
+            if non_headers.is_empty() {
                 return;
             }
-            match dir {
-                Direction::Up => {
-                    let mut new = self.playlists_tab.selected.saturating_sub(1);
-                    // Wrap around to bottom
-                    if new == 0 && self.playlists_tab.items.first().is_some()
-                        && matches!(self.playlists_tab.items.first(), Some(PlaylistItem::Header(_)))
-                    {
-                        new = len - 1;
-                    }
-                    self.playlists_tab.selected = new;
-                    // Skip over headers upward.
-                    while self.playlists_tab.selected > 0
-                        && matches!(
-                            self.playlists_tab.items.get(self.playlists_tab.selected),
-                            Some(PlaylistItem::Header(_))
-                        )
-                    {
-                        self.playlists_tab.selected =
-                            self.playlists_tab.selected.saturating_sub(1);
-                    }
+            // Find current position among non-headers.
+            let cur_pos = non_headers.iter().position(|&i| i == self.playlists_tab.selected).unwrap_or(0);
+            let new_pos = match dir {
+                Direction::Up | Direction::Top => {
+                    if cur_pos == 0 { non_headers.len() - 1 } else { cur_pos - 1 }
                 }
-                Direction::Down => {
-                    let mut new = (self.playlists_tab.selected + 1).min(len - 1);
-                    // Wrap around to first non-header
-                    if new == len - 1 && self.playlists_tab.items.last().is_some()
-                        && matches!(self.playlists_tab.items.last(), Some(PlaylistItem::Header(_)))
-                    {
-                        new = self.first_non_header_index();
-                    }
-                    self.playlists_tab.selected = new;
-                    // Skip over headers downward.
-                    while self.playlists_tab.selected + 1 < len
-                        && matches!(
-                            self.playlists_tab.items.get(self.playlists_tab.selected),
-                            Some(PlaylistItem::Header(_))
-                        )
-                    {
-                        self.playlists_tab.selected += 1;
-                    }
+                Direction::Down | Direction::Bottom => {
+                    if cur_pos + 1 >= non_headers.len() { 0 } else { cur_pos + 1 }
                 }
-                Direction::Top => {
-                    self.playlists_tab.selected = self.first_non_header_index();
-                }
-                Direction::Bottom => {
-                    // Find last non-header item
-                    self.playlists_tab.selected = len.saturating_sub(1);
-                    while self.playlists_tab.selected > 0
-                        && matches!(
-                            self.playlists_tab.items.get(self.playlists_tab.selected),
-                            Some(PlaylistItem::Header(_))
-                        )
-                    {
-                        self.playlists_tab.selected =
-                            self.playlists_tab.selected.saturating_sub(1);
-                    }
-                }
-                _ => {}
-            }
-            // Final safety clamp: never land on a header.
-            if matches!(
-                self.playlists_tab.items.get(self.playlists_tab.selected),
-                Some(PlaylistItem::Header(_))
-            ) {
-                self.playlists_tab.selected = self.first_non_header_index();
-            }
+                _ => cur_pos,
+            };
+            self.playlists_tab.selected = non_headers[new_pos];
             // Only reload when selection actually changed.
             if self.playlists_tab.selected != self.playlists_tab.prev_selected {
                 self.playlists_tab.prev_selected = self.playlists_tab.selected;
@@ -4237,17 +4228,27 @@ impl App {
         let Some(item) = self.playlists_tab.items.get(idx).cloned() else {
             return;
         };
+        // Increment generation so stale async responses are discarded.
+        self.playlists_tab.load_gen = self.playlists_tab.load_gen.wrapping_add(1);
+        // Check cache first.
+        if let Some(cached) = self.playlists_tab.tracks_cache.get(&idx) {
+            self.playlists_tab.tracks = cached.clone();
+            self.playlists_tab.selected_track = 0;
+            return;
+        }
         match item {
             PlaylistItem::Header(_) => {
                 self.playlists_tab.tracks.clear();
                 self.playlists_tab.selected_track = 0;
             }
             PlaylistItem::Saved { path, .. } => {
+                self.playlists_tab.saved_path = Some(path.clone());
                 // Load from local JSON file.
                 match std::fs::read_to_string(&path) {
                     Ok(data) => {
                         if let Ok(songs) = serde_json::from_str::<Vec<ratune_subsonic::Song>>(&data) {
-                            self.playlists_tab.tracks = songs;
+                            self.playlists_tab.tracks = songs.clone();
+                            self.playlists_tab.tracks_cache.insert(idx, songs);
                         }
                     }
                     Err(e) => {
@@ -4260,12 +4261,13 @@ impl App {
                 // Fetch server favorites.
                 let client = self.subsonic.clone();
                 let tx = self.library_tx.clone();
+                let gen = self.playlists_tab.load_gen;
                 self.playlists_tab.tracks.clear();
                 tokio::spawn(async move {
                     match client.get_starred().await {
                         Ok(starred) => {
                             let _ = tx
-                                .send(LibraryUpdate::PlaylistsTabTracks(starred))
+                                .send(LibraryUpdate::PlaylistsTabTracks(starred, gen))
                                 .await;
                         }
                         Err(e) => {
@@ -4293,9 +4295,15 @@ impl App {
         if name.is_empty() {
             return;
         }
+        // Save the appropriate songs: playlists_tab.tracks in Playlists tab, queue.songs elsewhere.
+        let songs = if self.active_tab == Tab::Playlists {
+            &self.playlists_tab.tracks
+        } else {
+            &self.queue.songs
+        };
         if let Ok(dir) = crate::persist::playlists_dir() {
             let path = dir.join(format!("{name}.json"));
-            if let Ok(json) = serde_json::to_string_pretty(&self.queue.songs) {
+            if let Ok(json) = serde_json::to_string_pretty(songs) {
                 let _ = std::fs::write(&path, json);
             }
         }
@@ -4306,6 +4314,7 @@ impl App {
     /// Fetch random songs (async), updating both tracks and cache.
     fn refetch_random_playlist(&mut self) {
         let count = self.playlists_tab.random_count;
+        let gen = self.playlists_tab.load_gen;
         let client = self.subsonic.clone();
         let tx = self.library_tx.clone();
         self.playlists_tab.tracks.clear();
@@ -4313,7 +4322,7 @@ impl App {
             match client.get_random_songs(count).await {
                 Ok(songs) => {
                     let _ = tx
-                        .send(LibraryUpdate::PlaylistsTabTracks(songs))
+                        .send(LibraryUpdate::PlaylistsTabTracks(songs, gen))
                         .await;
                 }
                 Err(e) => {
@@ -4328,8 +4337,50 @@ impl App {
         if self.active_tab != Tab::Playlists {
             return;
         }
+        // Only re-random when Random item is selected in left panel.
+        let idx = self.playlists_tab.selected;
+        if !matches!(self.playlists_tab.items.get(idx), Some(PlaylistItem::Random)) {
+            return;
+        }
         self.playlists_tab.random_tracks_cached = None;
+        self.playlists_tab.load_gen = self.playlists_tab.load_gen.wrapping_add(1);
         self.refetch_random_playlist();
+    }
+
+    /// Delete selected track from playlist (right panel).
+    fn handle_playlists_delete_track(&mut self) {
+        if self.active_tab != Tab::Playlists || self.playlists_tab.focus_left {
+            return;
+        }
+        let c = self.playlists_tab.selected_track;
+        if c >= self.playlists_tab.tracks.len() {
+            return;
+        }
+        // For Favorites, immediately unstar + remove without confirm.
+        let idx = self.playlists_tab.selected;
+        if matches!(self.playlists_tab.items.get(idx), Some(PlaylistItem::Favorites)) {
+            if let Some(song) = self.playlists_tab.tracks.get(c) {
+                let song_id = song.id.clone();
+                let client = self.subsonic.clone();
+                tokio::spawn(async move {
+                    let _ = client.unstar_song(&song_id).await;
+                });
+            }
+            self.playlists_tab.tracks.remove(c);
+            self.playlists_tab.tracks_cache.insert(idx, self.playlists_tab.tracks.clone());
+            self.playlists_tab.selected_track =
+                self.playlists_tab.selected_track.min(self.playlists_tab.tracks.len().saturating_sub(1));
+            return;
+        }
+        // For other playlists, remove immediately (auto-save handles persistence).
+        self.playlists_tab.tracks.remove(c);
+        self.playlists_tab.tracks_cache.insert(idx, self.playlists_tab.tracks.clone());
+        self.playlists_tab.selected_track =
+            self.playlists_tab.selected_track.min(self.playlists_tab.tracks.len().saturating_sub(1));
+        // Mark dirty for auto-save.
+        if self.playlists_tab.dirty_since.is_none() {
+            self.playlists_tab.dirty_since = Some(std::time::Instant::now());
+        }
     }
 
     // ── Playlists tab helpers ──────────────────────────────────────────────────
@@ -4388,8 +4439,10 @@ impl App {
                     _ => 0,
                 };
                 self.playlists_tab.favorites_count = count;
+                self.playlists_tab.load_gen = self.playlists_tab.load_gen.wrapping_add(1);
                 let client = self.subsonic.clone();
                 let tx = self.library_tx.clone();
+                let gen = self.playlists_tab.load_gen;
                 self.playlists_tab.tracks.clear();
                 tokio::spawn(async move {
                     // Always fetch starred (favorited) songs, truncate locally.
@@ -4398,7 +4451,7 @@ impl App {
                             if count > 0 {
                                 starred.truncate(count as usize);
                             }
-                            let _ = tx.send(LibraryUpdate::PlaylistsTabTracks(starred)).await;
+                            let _ = tx.send(LibraryUpdate::PlaylistsTabTracks(starred, gen)).await;
                         }
                         Err(e) => eprintln!("fetch favorites: {e}"),
                     }
@@ -4413,6 +4466,7 @@ impl App {
                 self.playlists_tab.random_count = count;
                 // Invalidate cache and refetch with new count.
                 self.playlists_tab.random_tracks_cached = None;
+                self.playlists_tab.load_gen = self.playlists_tab.load_gen.wrapping_add(1);
                 self.refetch_random_playlist();
             }
             _ => {}
@@ -4422,10 +4476,23 @@ impl App {
     // ── Queue reorder helpers ──────────────────────────────────────────────────
 
     fn handle_queue_move_up(&mut self) {
-        if self.active_tab != Tab::NowPlaying && self.active_tab != Tab::Playlists {
+        if self.active_tab == Tab::Playlists && !self.playlists_tab.focus_left {
+            let c = self.playlists_tab.selected_track;
+            if c == 0 || self.playlists_tab.tracks.is_empty() {
+                return;
+            }
+            self.playlists_tab.tracks.swap(c, c - 1);
+            self.playlists_tab.selected_track = c - 1;
+            // Update cache.
+            let idx = self.playlists_tab.selected;
+            self.playlists_tab.tracks_cache.insert(idx, self.playlists_tab.tracks.clone());
+            if c <= self.playlists_tab.track_scroll {
+                self.playlists_tab.track_scroll =
+                    self.playlists_tab.track_scroll.saturating_sub(1);
+            }
             return;
         }
-        if self.active_tab == Tab::Playlists && self.playlists_tab.focus_left {
+        if self.active_tab != Tab::NowPlaying {
             return;
         }
         let c = self.queue.cursor;
@@ -4440,10 +4507,24 @@ impl App {
     }
 
     fn handle_queue_move_down(&mut self) {
-        if self.active_tab != Tab::NowPlaying && self.active_tab != Tab::Playlists {
+        if self.active_tab == Tab::Playlists && !self.playlists_tab.focus_left {
+            let c = self.playlists_tab.selected_track;
+            if c + 1 >= self.playlists_tab.tracks.len() {
+                return;
+            }
+            self.playlists_tab.tracks.swap(c, c + 1);
+            self.playlists_tab.selected_track = c + 1;
+            // Update cache.
+            let idx = self.playlists_tab.selected;
+            self.playlists_tab.tracks_cache.insert(idx, self.playlists_tab.tracks.clone());
+            let viewport_end = self.playlists_tab.track_scroll + 15usize.saturating_sub(1);
+            if c + 1 > viewport_end {
+                self.playlists_tab.track_scroll =
+                    self.playlists_tab.track_scroll.saturating_add(1);
+            }
             return;
         }
-        if self.active_tab == Tab::Playlists && self.playlists_tab.focus_left {
+        if self.active_tab != Tab::NowPlaying {
             return;
         }
         let c = self.queue.cursor;

@@ -74,7 +74,7 @@ impl Theme {
                 let chrome = Color::Reset;
                 Self {
                     preset,
-                    accent: Color::Rgb(255, 140, 0),
+                    accent: Color::Rgb(200, 150, 90),
                     background: chrome,
                     tab_bar: chrome,
                     status_bar: chrome,
@@ -90,7 +90,7 @@ impl Theme {
                 let chrome = Color::Reset;
                 Self {
                     preset,
-                    accent: Color::Rgb(255, 140, 0),
+                    accent: Color::Rgb(200, 150, 90),
                     background: chrome,
                     tab_bar: chrome,
                     status_bar: chrome,

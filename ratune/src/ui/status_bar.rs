@@ -90,7 +90,21 @@ fn push_scrobble_status_spans(
 pub fn render(app: &App, frame: &mut Frame, area: Rect) {
     let t = &app.theme;
 
-    let line = if app.search_mode.active {
+    let line = if let Some(input) = &app.playlists_tab.save_input {
+        Line::from(vec![
+            Span::styled("Save as: ", Style::default().fg(app.accent())),
+            Span::styled(
+                input.as_str(),
+                Style::default().fg(t.foreground),
+            ),
+            Span::styled("_", Style::default().fg(app.accent())),
+            Span::raw("   "),
+            Span::styled("Enter", Style::default().fg(t.dimmed)),
+            Span::raw(" save  "),
+            Span::styled("Esc", Style::default().fg(t.dimmed)),
+            Span::raw(" cancel"),
+        ])
+    } else if app.search_mode.active {
         Line::from(vec![
             Span::styled("Search: ", Style::default().fg(app.accent())),
             Span::styled(
