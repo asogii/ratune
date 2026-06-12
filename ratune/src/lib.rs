@@ -946,7 +946,7 @@ async fn run_loop(
         eprintln!("warn: could not save state: {e}");
     }
     // Save any dirty playlist caches before exiting.
-    if let Some(since) = app.playlists_tab.dirty_since {
+    if app.playlists_tab.dirty_since.is_some() {
         // Always save dirty items regardless of 30s timer on quit.
         let idx = app.playlists_tab.selected;
         if let Some(path) = &app.playlists_tab.saved_path {

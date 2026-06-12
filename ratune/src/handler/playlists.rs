@@ -160,4 +160,54 @@ impl App {
             self.refresh_playlists_tab();
         }
     }
+
+    pub(crate) fn handle_navigate_playlists(&mut self, dir: crate::action::Direction) {
+        if self.playlists_tab.focus_left {
+            let non_headers: Vec<usize> = self.playlists_tab.items.iter().enumerate()
+                .filter(|(_, item)| !matches!(item, PlaylistItem::Header(_)))
+                .map(|(i, _)| i).collect();
+            if non_headers.is_empty() { return; }
+            let cur_pos = non_headers.iter().position(|&i| i == self.playlists_tab.selected).unwrap_or(0);
+            use crate::action::Direction;
+            let new_pos = match dir {
+                Direction::Up | Direction::Top => if cur_pos == 0 { non_headers.len() - 1 } else { cur_pos - 1 },
+                Direction::Down | Direction::Bottom => if cur_pos + 1 >= non_headers.len() { 0 } else { cur_pos + 1 },
+                _ => cur_pos,
+            };
+            self.playlists_tab.selected = non_headers[new_pos];
+            if self.playlists_tab.selected != self.playlists_tab.prev_selected {
+                self.playlists_tab.prev_selected = self.playlists_tab.selected;
+                self.load_selected_playlist();
+            }
+        } else {
+            let len = self.playlists_tab.tracks.len();
+            if len == 0 { return; }
+            use crate::action::Direction;
+            let page = 15usize;
+            self.playlists_tab.selected_track = match dir {
+                Direction::Up => self.playlists_tab.selected_track.saturating_sub(1),
+                Direction::Down => (self.playlists_tab.selected_track + 1).min(len - 1),
+                Direction::Top => 0,
+                Direction::Bottom => len - 1,
+                Direction::PageUp => self.playlists_tab.selected_track.saturating_sub(page),
+                Direction::PageDown => (self.playlists_tab.selected_track + page).min(len - 1),
+            };
+        }
+    }
+
+    pub(crate) fn handle_add_selected_playlist_track(&mut self) {
+        if let Some(song) = self.playlists_tab.tracks.get(self.playlists_tab.selected_track).cloned() {
+            let was_empty = self.queue.songs.is_empty();
+            self.queue.push(song);
+            if was_empty { self.queue.cursor = 0; self.play_current(); }
+        }
+    }
+
+    pub(crate) fn handle_play_all_playlist_tracks(&mut self) {
+        if self.playlists_tab.tracks.is_empty() { return; }
+        self.queue.songs = self.playlists_tab.tracks.clone();
+        self.queue.cursor = 0;
+        self.queue.scroll = 0;
+        self.play_current();
+    }
 }
